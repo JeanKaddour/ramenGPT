@@ -39,7 +39,7 @@
   - `--early_stop_steps` for bounded runs.
   - `--seed` to verify repeatability.
 - For experiments, keep quick checks on tiny settings before long runs.
-- Treat `wandb` usage as optional in local checks; use offline mode or disable logging in config when offline.
+- Treat `wandb` usage as optional in local checks; prefer online runs by default and only use offline mode when explicitly requested or when offline access is required.
 
 ## Commit & Pull Request Guidelines
 - Commit history uses short, imperative summaries (e.g., `Update README.md...`, `Refactor training loop...`).
