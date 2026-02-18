@@ -1,6 +1,175 @@
 import torch
 
 
+def create_optimizer(model, optimizer_config: dict, print_fn=print):
+    # Collect parameter groups - keep logic centralized to match existing behavior.
+    hidden_matrix_params = [
+        p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n
+    ]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n and p.ndim >= 2]
+    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2 and "x0_lambda" not in n]
+    x0_lambda_params = [p for n, p in model.named_parameters() if "x0_lambda" in n]
+    head_params = [model.lm_head.weight]
+
+    adam_cfg = optimizer_config["adam"]
+    scalar_adam_cfg = optimizer_config.get("scalar_adam", adam_cfg)
+    use_muon = optimizer_config.get("use_muon", True)
+
+    optimizers = []
+    scalar_opt = None
+    matrix_opt = None
+    matrix_optimizer_type = None
+
+    if use_muon and len(hidden_matrix_params) > 0:
+        # Use Muon/ARO/BAM for hidden matrix parameters if available.
+        adam_param_groups = []
+        if head_params + embed_params:
+            adam_param_groups.append(
+                {
+                    "params": head_params + embed_params,
+                    "lr": adam_cfg["lr"],
+                    "betas": adam_cfg["betas"],
+                    "eps": adam_cfg["eps"],
+                    "weight_decay": adam_cfg["weight_decay"],
+                }
+            )
+        adam_opt = Adam(adam_param_groups)
+
+        all_scalar_params = scalar_params + x0_lambda_params
+        if all_scalar_params:
+            scalar_param_groups = [
+                {
+                    "params": all_scalar_params,
+                    "lr": scalar_adam_cfg["lr"],
+                    "betas": scalar_adam_cfg.get("betas", (0.9, 0.99)),
+                    "eps": scalar_adam_cfg.get("eps", 1e-8),
+                    "weight_decay": scalar_adam_cfg.get("weight_decay", 0.0),
+                }
+            ]
+            scalar_opt = Adam(scalar_param_groups)
+            print_fn(f"Created separate scalar optimizer for {len(all_scalar_params)} parameters")
+
+        matrix_optimizer_type = optimizer_config.get("matrix_optimizer", "muon")
+        if matrix_optimizer_type == "aro":
+            aro_cfg = optimizer_config.get(
+                "aro",
+                {
+                    "lr": 0.02,
+                    "momentum": 0.95,
+                    "momentum_min": 0.85,
+                    "momentum_warmup_frac": 0.10,
+                    "momentum_cooldown_frac": 0.10,
+                    "nesterov": True,
+                    "sinkhorn_iters": 5,
+                },
+            )
+            matrix_opt = AROSinkhorn(
+                hidden_matrix_params,
+                lr=aro_cfg["lr"],
+                momentum=aro_cfg["momentum"],
+                weight_decay=aro_cfg.get("weight_decay", 0.0),
+                nesterov=aro_cfg.get("nesterov", True),
+                sinkhorn_iters=aro_cfg.get("sinkhorn_iters", 5),
+            )
+            print_fn(
+                f"Using ARO-Sinkhorn optimizer for {len(hidden_matrix_params)} matrix parameters"
+            )
+        elif matrix_optimizer_type == "bam":
+            bam_cfg = optimizer_config.get(
+                "bam",
+                {
+                    "lr": 0.02,
+                    "momentum": 0.95,
+                    "momentum_min": 0.85,
+                    "momentum_warmup_frac": 0.10,
+                    "momentum_cooldown_frac": 0.10,
+                    "nesterov": True,
+                    "sink_steps": 1,
+                },
+            )
+            matrix_opt = BAM(
+                hidden_matrix_params,
+                lr=bam_cfg["lr"],
+                momentum=bam_cfg["momentum"],
+                weight_decay=bam_cfg.get("weight_decay", 0.0),
+                nesterov=bam_cfg.get("nesterov", True),
+                sink_steps=bam_cfg.get("sink_steps", 1),
+            )
+            print_fn(f"Using BAM optimizer for {len(hidden_matrix_params)} matrix parameters")
+        else:
+            muon_cfg = optimizer_config.get(
+                "muon",
+                {
+                    "lr": 0.02,
+                    "momentum": 0.95,
+                    "momentum_min": 0.85,
+                    "momentum_warmup_frac": 0.144,
+                    "momentum_cooldown_frac": 0.024,
+                    "beta2": 0.95,
+                    "nesterov": True,
+                },
+            )
+            matrix_opt = NorMuon(
+                hidden_matrix_params,
+                lr=muon_cfg["lr"],
+                momentum=muon_cfg["momentum"],
+                beta2=muon_cfg.get("beta2", 0.95),
+                weight_decay=muon_cfg.get("weight_decay", 0.0),
+                nesterov=muon_cfg.get("nesterov", True),
+            )
+            print_fn(f"Using NorMuon optimizer for {len(hidden_matrix_params)} matrix parameters")
+
+        optimizers = [adam_opt, matrix_opt]
+        if scalar_opt:
+            optimizers.append(scalar_opt)
+
+    else:
+        # Use a single Adam optimizer for all non-scalar parameters.
+        adam_param_groups = []
+        non_scalar_params = hidden_matrix_params + head_params + embed_params
+        if non_scalar_params:
+            adam_param_groups.append(
+                {
+                    "params": non_scalar_params,
+                    "lr": adam_cfg["lr"],
+                    "betas": adam_cfg["betas"],
+                    "eps": adam_cfg["eps"],
+                    "weight_decay": adam_cfg["weight_decay"],
+                }
+            )
+        adam_opt = Adam(adam_param_groups)
+        optimizers = [adam_opt]
+
+        all_scalar_params = scalar_params + x0_lambda_params
+        if all_scalar_params:
+            scalar_param_groups = [
+                {
+                    "params": all_scalar_params,
+                    "lr": scalar_adam_cfg["lr"],
+                    "betas": scalar_adam_cfg.get("betas", (0.9, 0.99)),
+                    "eps": scalar_adam_cfg.get("eps", 1e-8),
+                    "weight_decay": 0.0,
+                }
+            ]
+            scalar_opt = Adam(scalar_param_groups)
+            optimizers.append(scalar_opt)
+
+        print_fn("Using Adam optimizer for all parameters")
+
+    return dict(
+        adam_opt=adam_opt,
+        matrix_opt=matrix_opt,
+        scalar_opt=scalar_opt,
+        optimizers=optimizers,
+        matrix_optimizer_type=matrix_optimizer_type,
+        hidden_matrix_params=hidden_matrix_params,
+        embed_params=embed_params,
+        scalar_params=scalar_params,
+        x0_lambda_params=x0_lambda_params,
+        head_params=head_params,
+    )
+
+
 @torch.compile(dynamic=False, fullgraph=True)
 def polar_express(G: torch.Tensor):
     """Polar Express sign method for orthogonalization."""
