@@ -27,7 +27,6 @@ model_config = dict(
 )
 
 # Modern architecture knobs
-# (kept from train_gpt.py-style flow, but with tiny defaults)
 gating_config = dict(
     use_attn_gate=True,
     use_value_embed_gate=True,
