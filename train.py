@@ -1,20 +1,21 @@
 import copy
+from functools import lru_cache
 import glob
+from itertools import cycle
 import math
 import os
+from pathlib import Path
 import sys
 import threading
 import time
-from functools import lru_cache
-from itertools import cycle
-from pathlib import Path
-import wandb
+
 import torch
 from torch import Tensor, nn
 import torch.nn.utils as nn_utils
 
 from model import GPT, next_multiple_of_n, set_flex_attention_kernel_options
 from optimizers import AdamSingleGPU, NorMuonSingleGPU
+import wandb
 
 
 def _load_data_shard(file: Path):
@@ -23,7 +24,9 @@ def _load_data_shard(file: Path):
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2])  # number of tokens (claimed)
     with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)  # avoid pin_memory copy by @YouJiacheng
+        tokens = torch.empty(
+            num_tokens, dtype=torch.uint16, pin_memory=True
+        )  # avoid pin_memory copy by @YouJiacheng
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy())  # avoid bytes->array copy by @YouJiacheng
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
@@ -42,17 +45,27 @@ class BOSFinder:
         self.quickload = quickload
         if quickload:
             # Only scan first 4 million tokens, then kickoff async thread to scan rest
-            self.bos_idx = (tokens[:4_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+            self.bos_idx = (
+                (tokens[:4_000_000] == BOS_ID)
+                .nonzero(as_tuple=True)[0]
+                .to(torch.int64)
+                .cpu()
+                .numpy()
+            )
             self.thread = None
             self.ready = threading.Event()
             self.start()
         else:
-            self.bos_idx = (tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+            self.bos_idx = (
+                (tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+            )
         self.i = 0
         self.batch_iter = 0
 
     def _load(self):
-        self.bos_idx_async = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self.bos_idx_async = (
+            (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        )
         self.ready.set()
 
     def start(self):
@@ -81,9 +94,11 @@ class BOSFinder:
                 raise StopIteration("Insufficient BOS ahead; hit tail of shard.")
             cur = self.bos_idx[idx]
             starts.append(cur)
-            end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
-                      cur + max_seq_len,
-                      cur + num_tokens_local - cur_len + 1)
+            end = min(
+                self.bos_idx[idx + 1] if idx + 1 < n else self.size,
+                cur + max_seq_len,
+                cur + num_tokens_local - cur_len + 1,
+            )
             ends.append(end)
             cur_len += end - cur
             idx += 1
@@ -118,6 +133,7 @@ class DataPreloader:
             self.thread.join()
         return self.data
 
+
 class TrainingManager:
     """
     Manages training schedule, optimizers, and model state changes.
@@ -130,25 +146,29 @@ class TrainingManager:
         self.print_fn = print_fn
 
         # Extract config sections
-        self.training_config = config.get('training_config', {})
-        self.batch_schedule_config = config.get('batch_schedule_config', {})
-        self.window_schedule_config = config.get('window_schedule_config', {})
-        self.embed_config = config.get('embed_config', {})
-        self.optimizer_config = config.get('optimizer_config', {})
-        self.data_config = config.get('data_config', {})
-        self.train_seq_len = self.data_config.get('train_micro_batch_tokens', self.data_config.get('train_seq_len'))
+        self.training_config = config.get("training_config", {})
+        self.batch_schedule_config = config.get("batch_schedule_config", {})
+        self.window_schedule_config = config.get("window_schedule_config", {})
+        self.embed_config = config.get("embed_config", {})
+        self.optimizer_config = config.get("optimizer_config", {})
+        self.data_config = config.get("data_config", {})
+        self.train_seq_len = self.data_config.get(
+            "train_micro_batch_tokens", self.data_config.get("train_seq_len")
+        )
 
         # Training parameters
-        self.num_iterations = self.training_config.get('num_iterations', 1845)
-        self.num_scheduled_iterations = self.training_config.get('num_scheduled_iterations', self.num_iterations)
+        self.num_iterations = self.training_config.get("num_iterations", 1845)
+        self.num_scheduled_iterations = self.training_config.get(
+            "num_scheduled_iterations", self.num_iterations
+        )
 
-        split_frac = self.embed_config.get('split_frac', 2/3)
+        split_frac = self.embed_config.get("split_frac", 2 / 3)
         self.split_step = math.ceil(split_frac * self.num_scheduled_iterations)
 
         # Current state
         self.current_batch_size_idx = 0
         self.current_window_size_idx = 0
-        self.current_window_size = self.window_schedule_config.get('schedule', [3])[0]
+        self.current_window_size = self.window_schedule_config.get("schedule", [3])[0]
         self.embed_split_done = False
         self.scalar_freeze_countdown = 0
 
@@ -158,16 +178,16 @@ class TrainingManager:
         self.muon_opt = None
 
         # Track transitions for scalar freeze
-        self.freeze_steps = self.optimizer_config.get('freeze_scalars_on_transition', 40)
+        self.freeze_steps = self.optimizer_config.get("freeze_scalars_on_transition", 40)
 
     def get_batch_size(self, step: int) -> int:
         """Get batch size (grad accum steps) for current step using stepped schedule."""
-        schedule_type = self.batch_schedule_config.get('schedule_type', 'stepped')
+        schedule_type = self.batch_schedule_config.get("schedule_type", "stepped")
 
-        if schedule_type == 'stepped':
-            batch_sizes = self.batch_schedule_config.get('batch_sizes', [8, 16, 24])
-            base_tokens = self.batch_schedule_config.get('base_tokens')
-            transitions = self.batch_schedule_config.get('transitions', [1/3, 2/3])
+        if schedule_type == "stepped":
+            batch_sizes = self.batch_schedule_config.get("batch_sizes", [8, 16, 24])
+            base_tokens = self.batch_schedule_config.get("base_tokens")
+            transitions = self.batch_schedule_config.get("transitions", [1 / 3, 2 / 3])
             progress = step / self.num_scheduled_iterations
 
             for i, trans in enumerate(transitions):
@@ -193,9 +213,9 @@ class TrainingManager:
     def _get_linear_batch_size(self, step: int) -> int:
         """Legacy linear batch size ramp."""
         progress = step / self.num_iterations
-        initial = self.batch_schedule_config.get('initial_grad_accum_steps', 8)
-        final = self.batch_schedule_config.get('final_grad_accum_steps', 24)
-        warmup_frac = self.batch_schedule_config.get('warmup_frac', 0.5)
+        initial = self.batch_schedule_config.get("initial_grad_accum_steps", 8)
+        final = self.batch_schedule_config.get("final_grad_accum_steps", 24)
+        warmup_frac = self.batch_schedule_config.get("warmup_frac", 0.5)
 
         if progress >= warmup_frac:
             return final
@@ -203,10 +223,10 @@ class TrainingManager:
 
     def get_window_size(self, step: int) -> int:
         """Get window size for current step using stepped schedule."""
-        schedule = self.window_schedule_config.get('schedule', [3, 7, 11])
-        final_ws = self.window_schedule_config.get('final_ws', 13)
-        post_yarn = self.window_schedule_config.get('post_yarn_extension', 20)
-        transitions = self.window_schedule_config.get('transitions', [1/3, 2/3])
+        schedule = self.window_schedule_config.get("schedule", [3, 7, 11])
+        final_ws = self.window_schedule_config.get("final_ws", 13)
+        post_yarn = self.window_schedule_config.get("post_yarn_extension", 20)
+        transitions = self.window_schedule_config.get("transitions", [1 / 3, 2 / 3])
 
         # Post-training extension phase
         if step >= self.num_scheduled_iterations:
@@ -225,7 +245,7 @@ class TrainingManager:
     def get_window_size_blocks(self, step: int, block_size: int = 128) -> Tensor:
         """Get window size in blocks for FlexAttention."""
         ws = self.get_window_size(step)
-        return torch.tensor(ws * block_size // block_size, dtype=torch.int32, device='cuda')
+        return torch.tensor(ws * block_size // block_size, dtype=torch.int32, device="cuda")
 
     def advance_schedule(self, step: int):
         """
@@ -234,8 +254,8 @@ class TrainingManager:
         """
         # Check for batch size transitions
         old_batch_idx = self.current_batch_size_idx
-        batch_sizes = self.batch_schedule_config.get('batch_sizes', [8, 16, 24])
-        transitions = self.batch_schedule_config.get('transitions', [1/3, 2/3])
+        batch_sizes = self.batch_schedule_config.get("batch_sizes", [8, 16, 24])
+        transitions = self.batch_schedule_config.get("transitions", [1 / 3, 2 / 3])
         progress = step / self.num_scheduled_iterations
 
         for i, trans in enumerate(transitions):
@@ -257,19 +277,25 @@ class TrainingManager:
         if new_ws != old_ws:
             self.print_fn(f"Step {step}: Window size transition {old_ws} -> {new_ws}")
             # Call YaRN update if model has yarn
-            if hasattr(self.model, 'yarn') and self.model.yarn is not None:
+            if hasattr(self.model, "yarn") and self.model.yarn is not None:
                 self.model.yarn.apply(old_ws, new_ws)
             self.current_window_size = new_ws
             self.scalar_freeze_countdown = self.freeze_steps
 
         # Check for embed/lm_head split
         if not self.embed_split_done and step == self.split_step:
-            if hasattr(self.model, 'create_embed'):
-                self.print_fn(f"Step {step}: Splitting embed from lm_head (split_step={self.split_step})")
+            if hasattr(self.model, "create_embed"):
+                self.print_fn(
+                    f"Step {step}: Splitting embed from lm_head (split_step={self.split_step})"
+                )
                 self.model.create_embed()
                 self.embed_split_done = True
                 # Add new embed to Adam optimizer and copy state from lm_head
-                if self.adam_opt is not None and hasattr(self.model, 'embed') and self.model.embed is not None:
+                if (
+                    self.adam_opt is not None
+                    and hasattr(self.model, "embed")
+                    and self.model.embed is not None
+                ):
                     self._copy_lm_to_embed()
 
         # Decrement scalar freeze countdown
@@ -292,17 +318,17 @@ class TrainingManager:
 
         # Resolve lm_head parameter from model first, then fall back to labels.
         lm_head = None
-        if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
+        if hasattr(self.model, "lm_head") and hasattr(self.model.lm_head, "weight"):
             lm_head = self.model.lm_head.weight
-        if lm_head is None and hasattr(self.model, 'named_parameters'):
+        if lm_head is None and hasattr(self.model, "named_parameters"):
             for name, p in self.model.named_parameters():
-                if name.endswith('lm_head.weight'):
+                if name.endswith("lm_head.weight"):
                     lm_head = p
                     break
         if lm_head is None:
             for group in self.adam_opt.param_groups:
-                for p in group['params']:
-                    if getattr(p, 'label', None) == 'lm_head':
+                for p in group["params"]:
+                    if getattr(p, "label", None) == "lm_head":
                         lm_head = p
                         break
                 if lm_head is not None:
@@ -314,7 +340,7 @@ class TrainingManager:
 
         lm_head_group = None
         for group in self.adam_opt.param_groups:
-            if lm_head in group['params']:
+            if lm_head in group["params"]:
                 lm_head_group = group
                 break
         if lm_head_group is None:
@@ -324,33 +350,41 @@ class TrainingManager:
         embed = self.model.embed.weight
         # If resuming from a checkpoint after split, this param group may already exist.
         for group in self.adam_opt.param_groups:
-            if embed in group['params']:
+            if embed in group["params"]:
                 return
 
         # Add embed to optimizer with same config as lm_head
-        lr = lm_head_group.get('lr', self.optimizer_config.get('adam', {}).get('lr', 0.008))
-        betas = lm_head_group.get('betas', self.optimizer_config.get('adam', {}).get('betas', (0.65, 0.95)))
-        eps = lm_head_group.get('eps', self.optimizer_config.get('adam', {}).get('eps', 1e-8))
-        weight_decay = lm_head_group.get('weight_decay', self.optimizer_config.get('adam', {}).get('weight_decay', 0.005))
-        self.adam_opt.add_param_group({
-            'params': [embed],
-            'lr': lr,
-            'betas': betas,
-            'eps': eps,
-            'weight_decay': weight_decay,
-            'initial_lr': lr,
-        })
+        lr = lm_head_group.get("lr", self.optimizer_config.get("adam", {}).get("lr", 0.008))
+        betas = lm_head_group.get(
+            "betas", self.optimizer_config.get("adam", {}).get("betas", (0.65, 0.95))
+        )
+        eps = lm_head_group.get("eps", self.optimizer_config.get("adam", {}).get("eps", 1e-8))
+        weight_decay = lm_head_group.get(
+            "weight_decay", self.optimizer_config.get("adam", {}).get("weight_decay", 0.005)
+        )
+        self.adam_opt.add_param_group(
+            {
+                "params": [embed],
+                "lr": lr,
+                "betas": betas,
+                "eps": eps,
+                "weight_decay": weight_decay,
+                "initial_lr": lr,
+            }
+        )
 
         # Copy optimizer state from lm_head to embed
         if lm_head in self.adam_opt.state:
             lm_head_state = self.adam_opt.state[lm_head]
             embed_state = self.adam_opt.state[embed] = {}
-            embed_state['step'] = lm_head_state.get('step', 0)
-            if 'exp_avg' in lm_head_state:
-                embed_state['exp_avg'] = lm_head_state['exp_avg'].clone()
-            if 'exp_avg_sq' in lm_head_state:
-                embed_state['exp_avg_sq'] = lm_head_state['exp_avg_sq'].clone()
-            self.print_fn(f"Copied optimizer state from lm_head to embed (step={embed_state['step']})")
+            embed_state["step"] = lm_head_state.get("step", 0)
+            if "exp_avg" in lm_head_state:
+                embed_state["exp_avg"] = lm_head_state["exp_avg"].clone()
+            if "exp_avg_sq" in lm_head_state:
+                embed_state["exp_avg_sq"] = lm_head_state["exp_avg_sq"].clone()
+            self.print_fn(
+                f"Copied optimizer state from lm_head to embed (step={embed_state['step']})"
+            )
 
     def step_optimizers(self, step: int):
         """Step optimizers according to schedule."""
@@ -375,7 +409,10 @@ class TrainingManager:
 # -----------------------------------------------------------------------------
 # Simple data loader for single GPU
 
-def single_gpu_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, align_to_bos: bool = True):
+
+def single_gpu_data_generator(
+    filename_pattern: str, num_tokens: int, max_seq_len: int, align_to_bos: bool = True
+):
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     if not files:
         raise FileNotFoundError(f"No data shards matched pattern: {filename_pattern}")
@@ -399,11 +436,12 @@ def single_gpu_data_generator(filename_pattern: str, num_tokens: int, max_seq_le
         else:
             if pos + num_tokens + 1 >= len(tokens):
                 tokens, pos = _load_data_shard(next(file_iter)), 0
-            buf = tokens[pos:pos + num_tokens + 1]
+            buf = tokens[pos : pos + num_tokens + 1]
             pos += num_tokens
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         yield inputs, targets
+
 
 # batch size schedule: gradually increase gradient accumulation steps (legacy fallback)
 def get_grad_accum_steps(step: int, training_config=None, batch_schedule_config=None):
@@ -416,13 +454,13 @@ def get_grad_accum_steps(step: int, training_config=None, batch_schedule_config=
             "get_grad_accum_steps requires an explicit batch_schedule_config when called outside run_training."
         )
 
-    x = step / training_config['num_iterations'] # progress in training
+    x = step / training_config["num_iterations"]  # progress in training
     assert 0 <= x <= 1
 
-    initial_steps = batch_schedule_config['initial_grad_accum_steps']
-    final_steps = batch_schedule_config['final_grad_accum_steps']
-    warmup_frac = batch_schedule_config['warmup_frac']
-    schedule_type = batch_schedule_config['schedule_type']
+    initial_steps = batch_schedule_config["initial_grad_accum_steps"]
+    final_steps = batch_schedule_config["final_grad_accum_steps"]
+    warmup_frac = batch_schedule_config["warmup_frac"]
+    schedule_type = batch_schedule_config["schedule_type"]
 
     if x >= warmup_frac:
         # After warmup, use final batch size
@@ -431,13 +469,16 @@ def get_grad_accum_steps(step: int, training_config=None, batch_schedule_config=
     # During warmup, interpolate based on schedule type
     warmup_progress = x / warmup_frac
 
-    if schedule_type == 'linear':
+    if schedule_type == "linear":
         # Linear interpolation
         steps = initial_steps + (final_steps - initial_steps) * warmup_progress
-    elif schedule_type == 'cosine':
+    elif schedule_type == "cosine":
         # Cosine schedule (smooth transition)
-        steps = initial_steps + (final_steps - initial_steps) * (1 - math.cos(warmup_progress * math.pi)) / 2
-    elif schedule_type == 'exponential':
+        steps = (
+            initial_steps
+            + (final_steps - initial_steps) * (1 - math.cos(warmup_progress * math.pi)) / 2
+        )
+    elif schedule_type == "exponential":
         # Exponential growth
         log_ratio = math.log(final_steps / initial_steps)
         steps = initial_steps * math.exp(log_ratio * warmup_progress)
@@ -447,40 +488,43 @@ def get_grad_accum_steps(step: int, training_config=None, batch_schedule_config=
     # Round to nearest integer
     return int(round(steps))
 
+
 # -----------------------------------------------------------------------------
 # Main training code
 
 
 def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     model_config = config.model_config
-    model_type = model_config.get('model_type', 'gpt')
+    model_type = model_config.get("model_type", "gpt")
     data_config = config.data_config
     training_config = config.training_config
     optimizer_config = config.optimizer_config
     batch_schedule_config = config.batch_schedule_config
     warmup_config = config.warmup_config
     logging_config = config.logging_config
-    compilation_config = getattr(config, 'compilation_config', {'compile_model': False})
-    lr_scheduler_config = getattr(config, 'lr_scheduler_config', None)
-    train_micro_batch_tokens = data_config.get('train_micro_batch_tokens', data_config['train_seq_len'])
+    compilation_config = getattr(config, "compilation_config", {"compile_model": False})
+    lr_scheduler_config = getattr(config, "lr_scheduler_config", None)
+    train_micro_batch_tokens = data_config.get(
+        "train_micro_batch_tokens", data_config["train_seq_len"]
+    )
 
     # Match train_gpt.py: allow DATA_PATH to prefix data file globs.
     data_path = os.environ.get("DATA_PATH", ".")
     data_config["train_files"] = os.path.join(data_path, data_config["train_files"])
     data_config["val_files"] = os.path.join(data_path, data_config["val_files"])
 
-    attention_config = getattr(config, 'attention_config', None)
-    attention_pattern_config = getattr(config, 'attention_pattern_config', None)
-    lambda_config = getattr(config, 'lambda_config', None)
-    lr_multipliers = optimizer_config.get('lr_multipliers', {})
-    wd_multipliers = optimizer_config.get('wd_multipliers', {})
+    attention_config = getattr(config, "attention_config", None)
+    attention_pattern_config = getattr(config, "attention_pattern_config", None)
+    lambda_config = getattr(config, "lambda_config", None)
+    lr_multipliers = optimizer_config.get("lr_multipliers", {})
+    wd_multipliers = optimizer_config.get("wd_multipliers", {})
 
     # New config sections for train_gpt.py alignment
-    gating_config = getattr(config, 'gating_config', None)
-    skip_config = getattr(config, 'skip_config', None)
-    rope_config = getattr(config, 'rope_config', None)
-    embed_config = getattr(config, 'embed_config', None)
-    window_schedule_config = getattr(config, 'window_schedule_config', None)
+    gating_config = getattr(config, "gating_config", None)
+    skip_config = getattr(config, "skip_config", None)
+    rope_config = getattr(config, "rope_config", None)
+    embed_config = getattr(config, "embed_config", None)
+    window_schedule_config = getattr(config, "window_schedule_config", None)
 
     # Extract gradient clipping configuration from training config
     if attention_config is None:
@@ -488,28 +532,30 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
     # Apply command-line overrides for activation function
     if args.activation is not None:
-        model_config['activation'] = args.activation
+        model_config["activation"] = args.activation
         print(f"Override: activation = {args.activation}")
 
     if args.ffn_dim is not None:
         if args.ffn_dim < 1:
             raise ValueError("--ffn_dim must be >= 1")
-        model_config['ffn_dim'] = args.ffn_dim
+        model_config["ffn_dim"] = args.ffn_dim
         print(f"Override: ffn_dim = {args.ffn_dim}")
 
     if args.checkpoint_every is not None:
         if args.checkpoint_every < 0:
             raise ValueError("--checkpoint_every must be >= 0")
-        training_config['checkpoint_every'] = args.checkpoint_every
+        training_config["checkpoint_every"] = args.checkpoint_every
         print(f"Override: checkpoint_every = {args.checkpoint_every}")
 
     # Configure model backend features tied to GPU architecture.
-    set_flex_attention_kernel_options(detected_gpu_info.get('architecture'))
+    set_flex_attention_kernel_options(detected_gpu_info.get("architecture"))
 
     # -----------------------------------------------------------------------------
-    #    Construct model and optimizer     
+    #    Construct model and optimizer
     # -----------------------------------------------------------------------------
-    max_seq_len = max(data_config['train_seq_len'], data_config['val_seq_len'], train_micro_batch_tokens)
+    max_seq_len = max(
+        data_config["train_seq_len"], data_config["val_seq_len"], train_micro_batch_tokens
+    )
 
     # Create model with new config parameters
     model: nn.Module = GPT(
@@ -532,29 +578,27 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
     # Create TrainingManager
     training_manager_config = {
-        'training_config': training_config,
-        'batch_schedule_config': batch_schedule_config,
-        'window_schedule_config': window_schedule_config or {},
-        'embed_config': embed_config or {},
-        'data_config': data_config,
-        'optimizer_config': optimizer_config,
+        "training_config": training_config,
+        "batch_schedule_config": batch_schedule_config,
+        "window_schedule_config": window_schedule_config or {},
+        "embed_config": embed_config or {},
+        "data_config": data_config,
+        "optimizer_config": optimizer_config,
     }
     training_manager = TrainingManager(model, training_manager_config, print_fn=print)
 
     # init the optimizer(s)
-    adam_cfg = optimizer_config['adam']
-    scalar_adam_cfg = optimizer_config.get('scalar_adam', adam_cfg)  # Separate config for scalars
-    use_muon = optimizer_config.get('use_muon', True)
+    adam_cfg = optimizer_config["adam"]
+    scalar_adam_cfg = optimizer_config.get("scalar_adam", adam_cfg)  # Separate config for scalars
+    use_muon = optimizer_config.get("use_muon", True)
 
     # Collect parameters - more granular grouping for train_gpt.py alignment
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters()
-                            if p.ndim >= 2 and "embed" not in n]
-    embed_params = [p for n, p in model.named_parameters()
-                    if "embed" in n and p.ndim >= 2]
-    scalar_params = [p for n, p in model.named_parameters()
-                    if p.ndim < 2 and "x0_lambda" not in n]
-    x0_lambda_params = [p for n, p in model.named_parameters()
-                    if "x0_lambda" in n]
+    hidden_matrix_params = [
+        p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n
+    ]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n and p.ndim >= 2]
+    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2 and "x0_lambda" not in n]
+    x0_lambda_params = [p for n, p in model.named_parameters() if "x0_lambda" in n]
     head_params = [model.lm_head.weight]
 
     # Setup optimizers based on configuration
@@ -568,13 +612,15 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         # Head and embed params use standard Adam config
         if head_params + embed_params:
-            adam_param_groups.append({
-                'params': head_params + embed_params,
-                'lr': adam_cfg['lr'],
-                'betas': adam_cfg['betas'],
-                'eps': adam_cfg['eps'],
-                'weight_decay': adam_cfg['weight_decay']
-            })
+            adam_param_groups.append(
+                {
+                    "params": head_params + embed_params,
+                    "lr": adam_cfg["lr"],
+                    "betas": adam_cfg["betas"],
+                    "eps": adam_cfg["eps"],
+                    "weight_decay": adam_cfg["weight_decay"],
+                }
+            )
 
         optimizer1 = AdamSingleGPU(adam_param_groups)
 
@@ -582,31 +628,38 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         scalar_param_groups = []
         all_scalar_params = scalar_params + x0_lambda_params
         if all_scalar_params:
-            scalar_param_groups.append({
-                'params': all_scalar_params,
-                'lr': scalar_adam_cfg['lr'],
-                'betas': scalar_adam_cfg.get('betas', (0.9, 0.99)),  # Higher momentum
-                'eps': scalar_adam_cfg.get('eps', 1e-8),
-                'weight_decay': scalar_adam_cfg.get('weight_decay', 0.0)  # No WD on scalars
-            })
+            scalar_param_groups.append(
+                {
+                    "params": all_scalar_params,
+                    "lr": scalar_adam_cfg["lr"],
+                    "betas": scalar_adam_cfg.get("betas", (0.9, 0.99)),  # Higher momentum
+                    "eps": scalar_adam_cfg.get("eps", 1e-8),
+                    "weight_decay": scalar_adam_cfg.get("weight_decay", 0.0),  # No WD on scalars
+                }
+            )
             scalar_opt = AdamSingleGPU(scalar_param_groups)
             print(f"Created separate scalar optimizer for {len(all_scalar_params)} parameters")
 
-        muon_cfg = optimizer_config.get('muon', {
-            'lr': 0.02,
-            'momentum': 0.95,
-            'momentum_min': 0.85,
-            'momentum_warmup_frac': 0.144,   # 300/2090 from train_gpt.py
-            'momentum_cooldown_frac': 0.024, # 50/2090 from train_gpt.py
-            'beta2': 0.95,
-            'nesterov': True,
-        })
-        optimizer2 = NorMuonSingleGPU(hidden_matrix_params,
-                                      lr=muon_cfg['lr'],
-                                      momentum=muon_cfg['momentum'],
-                                      beta2=muon_cfg.get('beta2', 0.95),
-                                      weight_decay=muon_cfg.get('weight_decay', 0.0),
-                                      nesterov=muon_cfg.get('nesterov', True))
+        muon_cfg = optimizer_config.get(
+            "muon",
+            {
+                "lr": 0.02,
+                "momentum": 0.95,
+                "momentum_min": 0.85,
+                "momentum_warmup_frac": 0.144,  # 300/2090 from train_gpt.py
+                "momentum_cooldown_frac": 0.024,  # 50/2090 from train_gpt.py
+                "beta2": 0.95,
+                "nesterov": True,
+            },
+        )
+        optimizer2 = NorMuonSingleGPU(
+            hidden_matrix_params,
+            lr=muon_cfg["lr"],
+            momentum=muon_cfg["momentum"],
+            beta2=muon_cfg.get("beta2", 0.95),
+            weight_decay=muon_cfg.get("weight_decay", 0.0),
+            nesterov=muon_cfg.get("nesterov", True),
+        )
         optimizers = [optimizer1, optimizer2]
         if scalar_opt:
             optimizers.append(scalar_opt)
@@ -614,9 +667,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         # Connect optimizers to TrainingManager
         training_manager.set_optimizers(
-            adam_opt=optimizer1,
-            scalar_opt=scalar_opt,
-            muon_opt=optimizer2
+            adam_opt=optimizer1, scalar_opt=scalar_opt, muon_opt=optimizer2
         )
     else:
         # Use a single Adam optimizer for all parameters
@@ -626,26 +677,30 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         # Regular parameters (excluding scalars)
         non_scalar_params = hidden_matrix_params + head_params + embed_params
         if non_scalar_params:
-            adam_param_groups.append({
-                'params': non_scalar_params,
-                'lr': adam_cfg['lr'],
-                'betas': adam_cfg['betas'],
-                'eps': adam_cfg['eps'],
-                'weight_decay': adam_cfg['weight_decay']
-            })
+            adam_param_groups.append(
+                {
+                    "params": non_scalar_params,
+                    "lr": adam_cfg["lr"],
+                    "betas": adam_cfg["betas"],
+                    "eps": adam_cfg["eps"],
+                    "weight_decay": adam_cfg["weight_decay"],
+                }
+            )
 
         optimizer1 = AdamSingleGPU(adam_param_groups)
 
         # Separate scalar optimizer
         all_scalar_params = scalar_params + x0_lambda_params
         if all_scalar_params:
-            scalar_param_groups = [{
-                'params': all_scalar_params,
-                'lr': scalar_adam_cfg['lr'],
-                'betas': scalar_adam_cfg.get('betas', (0.9, 0.99)),
-                'eps': scalar_adam_cfg.get('eps', 1e-8),
-                'weight_decay': 0.0
-            }]
+            scalar_param_groups = [
+                {
+                    "params": all_scalar_params,
+                    "lr": scalar_adam_cfg["lr"],
+                    "betas": scalar_adam_cfg.get("betas", (0.9, 0.99)),
+                    "eps": scalar_adam_cfg.get("eps", 1e-8),
+                    "weight_decay": 0.0,
+                }
+            ]
             scalar_opt = AdamSingleGPU(scalar_param_groups)
 
         optimizers = [optimizer1]
@@ -654,14 +709,10 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         print("Using Adam optimizer for all parameters")
 
         # Connect optimizers to TrainingManager
-        training_manager.set_optimizers(
-            adam_opt=optimizer1,
-            scalar_opt=scalar_opt,
-            muon_opt=None
-        )
+        training_manager.set_optimizers(adam_opt=optimizer1, scalar_opt=scalar_opt, muon_opt=None)
 
     # Print gradient clipping configuration
-    grad_clip_norm = training_config.get('grad_clip_norm', None)  # None means no clipping
+    grad_clip_norm = training_config.get("grad_clip_norm", None)  # None means no clipping
 
     if grad_clip_norm is not None:
         print(f"Gradient clipping enabled: max_norm = {grad_clip_norm}")
@@ -673,23 +724,27 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             group["initial_lr"] = group["lr"]
 
     # Initialize wandb after model creation
-    if logging_config['use_wandb']:
+    if logging_config["use_wandb"]:
         # Generate descriptive run name with model type and key parameters
         model_size_info = ""
-        if model_type == 'gpt':
+        if model_type == "gpt":
             model_size_info = f"{model_config['num_layers']}L_{model_config['model_dim']}D_{model_config['num_heads']}H"
-        elif model_type in ['mamba', 'mamba2']:
+        elif model_type in ["mamba", "mamba2"]:
             model_size_info = f"{model_config['num_layers']}L_{model_config['hidden_size']}D"
-        elif model_type in ['gla', 'retnet', 'linear_attn', 'rwkv6', 'hgrn']:
+        elif model_type in ["gla", "retnet", "linear_attn", "rwkv6", "hgrn"]:
             model_size_info = f"{model_config['num_hidden_layers']}L_{model_config['hidden_size']}D_{model_config['num_heads']}H"
 
         # Get sequence length and batch size info
         seq_len_info = f"seq{data_config['train_seq_len']}"
-        micro_batch_tokens = data_config.get('train_micro_batch_tokens', data_config['train_seq_len'])
-        grad_accum_initial = batch_schedule_config.get('initial_grad_accum_steps', 1)
-        grad_accum_final = batch_schedule_config.get('final_grad_accum_steps', grad_accum_initial)
-        train_seq_len = max(1, data_config['train_seq_len'])
-        micro_batch_size = data_config.get('batch_size_multiple', micro_batch_tokens // train_seq_len)
+        micro_batch_tokens = data_config.get(
+            "train_micro_batch_tokens", data_config["train_seq_len"]
+        )
+        grad_accum_initial = batch_schedule_config.get("initial_grad_accum_steps", 1)
+        grad_accum_final = batch_schedule_config.get("final_grad_accum_steps", grad_accum_initial)
+        train_seq_len = max(1, data_config["train_seq_len"])
+        micro_batch_size = data_config.get(
+            "batch_size_multiple", micro_batch_tokens // train_seq_len
+        )
         effective_batch_min_tokens = micro_batch_tokens * grad_accum_initial
         effective_batch_max_tokens = micro_batch_tokens * grad_accum_final
         batch_info = (
@@ -699,26 +754,30 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         # Calculate total parameters
         total_params = sum(p.numel() for p in model.parameters())
-        param_info = f"{total_params // 1_000_000}M" if total_params >= 1_000_000 else f"{total_params // 1_000}K"
+        param_info = (
+            f"{total_params // 1_000_000}M"
+            if total_params >= 1_000_000
+            else f"{total_params // 1_000}K"
+        )
 
         # Get activation function info
-        activation_name = model_config.get('activation', 'relu_squared')
+        activation_name = model_config.get("activation", "relu_squared")
         # Shorten common activation names for the run name
         activation_short = {
-            'relu_squared': 'relu2',
-            'gelu': 'gelu',
-            'swish': 'swish',
-            'silu': 'silu',
-            'geglu': 'geglu',
-            'swiglu': 'swiglu',
+            "relu_squared": "relu2",
+            "gelu": "gelu",
+            "swish": "swish",
+            "silu": "silu",
+            "geglu": "geglu",
+            "swiglu": "swiglu",
         }.get(activation_name, activation_name)
         activation_info = f"_{activation_short}"
 
         # Generate automatic run name if not specified
-        if logging_config['wandb_run_name'] is None:
+        if logging_config["wandb_run_name"] is None:
             wandb_run_name = f"{model_type}_{model_size_info}_{param_info}_{seq_len_info}{activation_info}_{batch_info}"
         else:
-            wandb_run_name = logging_config['wandb_run_name']
+            wandb_run_name = logging_config["wandb_run_name"]
 
         # Use a single project for all runs
         wandb_project = "modded-nanogpt-comparison"  # Override individual project names
@@ -732,7 +791,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         ]
 
         # Add optimizer info to tags
-        if optimizer_config.get('use_muon', True) and len(optimizers) > 1:
+        if optimizer_config.get("use_muon", True) and len(optimizers) > 1:
             tags.append("muon_adam")
         else:
             tags.append("adam_only")
@@ -775,7 +834,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                 print(s)
             print(s, file=f)
 
-    print_log("="*100)
+    print_log("=" * 100)
     # log information about the hardware/software environment this is running on
     print_log(f"Running Python {sys.version}")
     print_log(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
@@ -786,14 +845,18 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
     def nvidia_smi():
         import subprocess
-        return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+
+        return subprocess.run(
+            ["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        ).stdout
+
     print_log(nvidia_smi())
-    print_log("="*100)
+    print_log("=" * 100)
 
     # learning rate scheduler: supports multiple scheduler types
     def get_lr(step: int):
-        num_iterations = training_config['num_iterations']
-        num_scheduled_iterations = training_config.get('num_scheduled_iterations', num_iterations)
+        num_iterations = training_config["num_iterations"]
+        num_scheduled_iterations = training_config.get("num_scheduled_iterations", num_iterations)
 
         # Extension phase
         if step > num_scheduled_iterations:
@@ -801,14 +864,14 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         # Use lr_scheduler_config if available, otherwise fall back to legacy config
         if lr_scheduler_config is not None:
-            scheduler_type = lr_scheduler_config.get('scheduler_type', 'linear')
-            warmup_steps = lr_scheduler_config.get('warmup_steps', 0)
-            use_linear_warmup = lr_scheduler_config.get('use_linear_warmup', True)
+            scheduler_type = lr_scheduler_config.get("scheduler_type", "linear")
+            warmup_steps = lr_scheduler_config.get("warmup_steps", 0)
+            use_linear_warmup = lr_scheduler_config.get("use_linear_warmup", True)
 
             # Determine cooldown steps
-            cooldown_steps = lr_scheduler_config.get('cooldown_steps')
+            cooldown_steps = lr_scheduler_config.get("cooldown_steps")
             if cooldown_steps is None:
-                cooldown_frac = training_config.get('cooldown_frac', 0.0)
+                cooldown_frac = training_config.get("cooldown_frac", 0.0)
                 cooldown_steps = int(num_iterations * cooldown_frac)
 
             # Main training steps (excluding warmup and cooldown)
@@ -834,16 +897,18 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             if adjusted_step < main_steps:
                 progress = adjusted_step / main_steps if main_steps > 0 else 1.0
 
-                if scheduler_type == 'cosine':
+                if scheduler_type == "cosine":
                     # Cosine annealing
-                    min_lr_ratio = lr_scheduler_config.get('cosine_min_lr_ratio', 0.1)
-                    lr_multiplier = min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+                    min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
+                    lr_multiplier = min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (
+                        1 + math.cos(math.pi * progress)
+                    )
 
-                elif scheduler_type == 'cosine_with_restarts':
+                elif scheduler_type == "cosine_with_restarts":
                     # Cosine annealing with warm restarts
-                    num_cycles = lr_scheduler_config.get('cosine_restart_cycles', 1)
-                    decay_factor = lr_scheduler_config.get('cosine_restart_decay', 1.0)
-                    min_lr_ratio = lr_scheduler_config.get('cosine_min_lr_ratio', 0.1)
+                    num_cycles = lr_scheduler_config.get("cosine_restart_cycles", 1)
+                    decay_factor = lr_scheduler_config.get("cosine_restart_decay", 1.0)
+                    min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
 
                     # Determine which cycle we're in
                     cycle_length = main_steps / num_cycles
@@ -851,18 +916,20 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                     cycle_progress = (adjusted_step % cycle_length) / cycle_length
 
                     # Apply decay to max LR for this cycle
-                    cycle_max = decay_factor ** cycle
+                    cycle_max = decay_factor**cycle
                     cycle_min = min_lr_ratio * cycle_max
 
                     # Cosine annealing within the cycle
-                    lr_multiplier = cycle_min + (cycle_max - cycle_min) * 0.5 * (1 + math.cos(math.pi * cycle_progress))
+                    lr_multiplier = cycle_min + (cycle_max - cycle_min) * 0.5 * (
+                        1 + math.cos(math.pi * cycle_progress)
+                    )
 
-                elif scheduler_type == 'exponential':
+                elif scheduler_type == "exponential":
                     # Exponential decay
-                    gamma = lr_scheduler_config.get('exponential_gamma', 0.95)
-                    lr_multiplier = gamma ** adjusted_step
+                    gamma = lr_scheduler_config.get("exponential_gamma", 0.95)
+                    lr_multiplier = gamma**adjusted_step
 
-                elif scheduler_type == 'linear':
+                elif scheduler_type == "linear":
                     # Linear decay (stable phase)
                     lr_multiplier = 1.0
 
@@ -873,29 +940,33 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             # Handle cooldown phase
             elif cooldown_steps > 0:
                 cooldown_progress = (adjusted_step - main_steps) / cooldown_steps
-                final_lr_ratio = lr_scheduler_config.get('final_lr_ratio', 0.1)
+                final_lr_ratio = lr_scheduler_config.get("final_lr_ratio", 0.1)
 
-                if scheduler_type == 'cosine' or scheduler_type == 'cosine_with_restarts':
+                if scheduler_type == "cosine" or scheduler_type == "cosine_with_restarts":
                     # Continue cosine decay in cooldown
-                    min_lr_ratio = lr_scheduler_config.get('cosine_min_lr_ratio', 0.1)
+                    min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
                     # Get the LR at the end of main phase
-                    if scheduler_type == 'cosine':
+                    if scheduler_type == "cosine":
                         main_end_lr = min_lr_ratio
                     else:
                         # For restarts, use the final cycle's minimum
-                        num_cycles = lr_scheduler_config.get('cosine_restart_cycles', 1)
-                        decay_factor = lr_scheduler_config.get('cosine_restart_decay', 1.0)
+                        num_cycles = lr_scheduler_config.get("cosine_restart_cycles", 1)
+                        decay_factor = lr_scheduler_config.get("cosine_restart_decay", 1.0)
                         main_end_lr = min_lr_ratio * (decay_factor ** (num_cycles - 1))
 
                     # Linear decay from main_end_lr to final_lr_ratio during cooldown
-                    lr_multiplier = main_end_lr * (1 - cooldown_progress) + final_lr_ratio * cooldown_progress
+                    lr_multiplier = (
+                        main_end_lr * (1 - cooldown_progress) + final_lr_ratio * cooldown_progress
+                    )
 
                 else:
                     # Linear cooldown for other schedulers
-                    lr_multiplier = (1 - cooldown_progress) * 1.0 + cooldown_progress * final_lr_ratio
+                    lr_multiplier = (
+                        1 - cooldown_progress
+                    ) * 1.0 + cooldown_progress * final_lr_ratio
             else:
                 # Beyond training steps
-                lr_multiplier = lr_scheduler_config.get('final_lr_ratio', 0.1)
+                lr_multiplier = lr_scheduler_config.get("final_lr_ratio", 0.1)
 
             return lr_multiplier
 
@@ -907,8 +978,8 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
             # Batch size schedule scaling (config-driven, not hardcoded thirds).
             if batch_schedule_config is not None:
-                batch_sizes = batch_schedule_config.get('batch_sizes')
-                transitions = batch_schedule_config.get('transitions')
+                batch_sizes = batch_schedule_config.get("batch_sizes")
+                transitions = batch_schedule_config.get("transitions")
                 if batch_sizes and len(batch_sizes) > 0:
                     current_idx = 0
                     if transitions:
@@ -921,35 +992,37 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                         scale = current_batch / base_batch
                         # Keep LR increases softer for tiny runs to avoid sharp loss jitter.
                         exponent = 0.45 if scale < 2.0 else 0.4
-                        lr_max = scale ** exponent
+                        lr_max = scale**exponent
             else:
                 # Fallback to previous default when no batch schedule exists.
-                if x > 1/3:
+                if x > 1 / 3:
                     lr_max = 1.52  # (16/8)**0.6
-                if x > 2/3:
+                if x > 2 / 3:
                     lr_max = 1.73  # (24/8)**0.5
 
-            lr_warmup_steps = warmup_config.get('lr_warmup_steps', 0)
+            lr_warmup_steps = warmup_config.get("lr_warmup_steps", 0)
 
             # Learning rate warmup phase
             if lr_warmup_steps > 0 and step < lr_warmup_steps:
                 # Linear warmup from 0 to 1
                 return step / lr_warmup_steps
             # Stable phase
-            elif x < 1 - training_config['cooldown_frac']:
+            elif x < 1 - training_config["cooldown_frac"]:
                 return lr_max
             # Cooldown phase
             else:
-                w = (1 - x) / training_config['cooldown_frac']
+                w = (1 - x) / training_config["cooldown_frac"]
                 return lr_max * w + (1 - w) * 0.1
 
     # attention window size schedule (only for GPT)
-    if model_type == 'gpt':
-        block_size = attention_config.get('block_size', 128)
+    if model_type == "gpt":
+        block_size = attention_config.get("block_size", 128)
 
         @lru_cache(maxsize=32)
         def get_window_size_blocks_helper(window_size: int):
-            return torch.tensor(window_size, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            return torch.tensor(window_size, dtype=torch.int32, pin_memory=True).cuda(
+                non_blocking=True
+            )
 
         def get_window_size_blocks(step: int):
             # Use TrainingManager's stepped schedule if window_schedule_config is available
@@ -958,9 +1031,9 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                 return get_window_size_blocks_helper(ws)
             else:
                 # Legacy: linearly increase the block-wise sliding window size over training
-                x = step / training_config['num_iterations']
+                x = step / training_config["num_iterations"]
                 assert 0 <= x <= 1
-                max_window_size = attention_config['max_window_size']
+                max_window_size = attention_config["max_window_size"]
                 window_size = next_multiple_of_n(max_window_size * x, n=block_size)
                 return get_window_size_blocks_helper(window_size // block_size)
 
@@ -974,6 +1047,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                     training_config=training_config,
                     batch_schedule_config=batch_schedule_config,
                 )
+
     else:
         # SSM models don't use window size blocks
         def get_window_size_blocks(step: int):
@@ -991,19 +1065,25 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     ########################################
 
     # Warmup the training kernels, then re-initialize the state so we aren't cheating
-    warmup_steps = warmup_config['warmup_steps']
-    initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                         optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers])
+    warmup_steps = warmup_config["warmup_steps"]
+    initial_state = dict(
+        model=copy.deepcopy(model.state_dict()),
+        optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers],
+    )
     # Use smaller sequence length for warmup if specified
-    warmup_seq_len = warmup_config.get('warmup_seq_len') or data_config['train_seq_len']
+    warmup_seq_len = warmup_config.get("warmup_seq_len") or data_config["train_seq_len"]
     print_log(f"Running warmup with sequence length: {warmup_seq_len}")
     for _ in range(warmup_steps):
-        inputs = targets = torch.randint(0, model_config['vocab_size'], size=(warmup_seq_len,), device="cuda")
-        if model_type == 'gpt':
+        inputs = targets = torch.randint(
+            0, model_config["vocab_size"], size=(warmup_seq_len,), device="cuda"
+        )
+        if model_type == "gpt":
             loss = model(inputs.to(torch.int32), targets, get_window_size_blocks(0))
         else:
             # SSM models expect different input format
-            outputs = model(input_ids=inputs[None, :].to(torch.int64), labels=targets[None, :].to(torch.int64))
+            outputs = model(
+                input_ids=inputs[None, :].to(torch.int64), labels=targets[None, :].to(torch.int64)
+            )
             loss = outputs.loss
         loss.backward()
         for opt in optimizers:
@@ -1016,31 +1096,39 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     print_log("Warmup complete, model state reset")
 
     # Compile model after warmup based on configuration
-    compile_model = compilation_config.get('compile_model', False)
+    compile_model = compilation_config.get("compile_model", False)
 
     if not compile_model:
         print_log("Model compilation disabled by configuration")
-    elif model_type in ['mamba', 'mamba2']:
+    elif model_type in ["mamba", "mamba2"]:
         print_log("Skipping compilation for Mamba models (known to cause recompilation overhead)")
     else:
         print_log("Compiling model...")
 
         try:
             # Check if block size is compatible with compiled FlexAttention
-            if model_type == 'gpt' and attention_config.get('block_size', 128) == 64:
-                print_log("Warning: Block size 64 may not be compatible with compiled FlexAttention")
-                print_log("If compilation fails, consider using block_size=128 in attention_config for compatibility")
+            if model_type == "gpt" and attention_config.get("block_size", 128) == 64:
+                print_log(
+                    "Warning: Block size 64 may not be compatible with compiled FlexAttention"
+                )
+                print_log(
+                    "If compilation fails, consider using block_size=128 in attention_config for compatibility"
+                )
 
             # For GPUs with shared memory constraints, use default mode
             # max-autotune is too slow for first run; default mode works well after our fixes
-            if detected_gpu_info.get('architecture') in ('ampere', 'blackwell'):
+            if detected_gpu_info.get("architecture") in ("ampere", "blackwell"):
                 compile_mode = "default"
-                print_log(f"  -> Using compile mode '{compile_mode}' for {detected_gpu_info.get('architecture')} architecture")
+                print_log(
+                    f"  -> Using compile mode '{compile_mode}' for {detected_gpu_info.get('architecture')} architecture"
+                )
             else:
                 compile_mode = "default"
 
             # Try compilation with appropriate settings
-            model: nn.Module = torch.compile(model, backend="inductor", dynamic=False, mode=compile_mode)
+            model: nn.Module = torch.compile(
+                model, backend="inductor", dynamic=False, mode=compile_mode
+            )
             print_log("Model compilation complete")
         except Exception as e:
             error_str = str(e)
@@ -1051,7 +1139,9 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             elif "No valid triton configs" in error_str or "out of resource" in error_str.lower():
                 print_log("This is due to Triton shared memory limits on your GPU")
                 print_log("The model will run in eager mode (slower but functional)")
-            print_log("Continuing without compilation - performance will be slower but training will work")
+            print_log(
+                "Continuing without compilation - performance will be slower but training will work"
+            )
             # Model remains uncompiled
 
     ########################################
@@ -1059,59 +1149,63 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     ########################################
 
     train_loader = single_gpu_data_generator(
-        data_config['train_files'],
+        data_config["train_files"],
         train_micro_batch_tokens,
-        data_config['train_seq_len'],
+        data_config["train_seq_len"],
         align_to_bos=True,
     )
     training_time_s = 0
-    train_tokens_processed = 0  # Track train-only tokens processed for clear throughput comparisons.
+    train_tokens_processed = (
+        0  # Track train-only tokens processed for clear throughput comparisons.
+    )
     total_tokens_processed = 0  # Track total tokens processed including validation.
     # Zero-align training time and tokens to the first completed train step for clean cross-run x-axes.
     first_train_step_time_s = None
     first_train_tokens_processed = None
     prev_train_step_time_s = None
     # begin training
-    train_steps = training_config['num_iterations']
+    train_steps = training_config["num_iterations"]
     # Limit iterations to early_stop_steps if specified
-    max_steps = min(train_steps + 1, args.early_stop_steps + 1) if args.early_stop_steps is not None else train_steps + 1
-
-
+    max_steps = (
+        min(train_steps + 1, args.early_stop_steps + 1)
+        if args.early_stop_steps is not None
+        else train_steps + 1
+    )
 
     # Log learning rate scheduler information
     if lr_scheduler_config is not None:
-        scheduler_type = lr_scheduler_config.get('scheduler_type', 'linear')
-        warmup_steps = lr_scheduler_config.get('warmup_steps', 0)
-        cooldown_steps = lr_scheduler_config.get('cooldown_steps')
+        scheduler_type = lr_scheduler_config.get("scheduler_type", "linear")
+        warmup_steps = lr_scheduler_config.get("warmup_steps", 0)
+        cooldown_steps = lr_scheduler_config.get("cooldown_steps")
         if cooldown_steps is None:
-            cooldown_frac = training_config.get('cooldown_frac', 0.0)
+            cooldown_frac = training_config.get("cooldown_frac", 0.0)
             cooldown_steps = int(train_steps * cooldown_frac)
         main_steps = train_steps - warmup_steps - cooldown_steps
 
         print_log(f"Learning rate scheduler: {scheduler_type}")
 
-        if scheduler_type == 'cosine':
-            min_lr_ratio = lr_scheduler_config.get('cosine_min_lr_ratio', 0.1)
+        if scheduler_type == "cosine":
+            min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
             print_log(f"  - Cosine annealing with min LR ratio: {min_lr_ratio}")
-        elif scheduler_type == 'cosine_with_restarts':
-            num_cycles = lr_scheduler_config.get('cosine_restart_cycles', 1)
-            decay_factor = lr_scheduler_config.get('cosine_restart_decay', 1.0)
-            min_lr_ratio = lr_scheduler_config.get('cosine_min_lr_ratio', 0.1)
+        elif scheduler_type == "cosine_with_restarts":
+            num_cycles = lr_scheduler_config.get("cosine_restart_cycles", 1)
+            decay_factor = lr_scheduler_config.get("cosine_restart_decay", 1.0)
+            min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
             print_log(f"  - Cosine with {num_cycles} restart cycle(s)")
             print_log(f"  - Restart decay factor: {decay_factor}, min LR ratio: {min_lr_ratio}")
-        elif scheduler_type == 'exponential':
-            gamma = lr_scheduler_config.get('exponential_gamma', 0.95)
+        elif scheduler_type == "exponential":
+            gamma = lr_scheduler_config.get("exponential_gamma", 0.95)
             print_log(f"  - Exponential decay with gamma: {gamma}")
 
         if warmup_steps > 0:
-            use_linear_warmup = lr_scheduler_config.get('use_linear_warmup', True)
+            use_linear_warmup = lr_scheduler_config.get("use_linear_warmup", True)
             warmup_type = "linear" if use_linear_warmup else "cosine"
             print_log(f"  - Warmup: {warmup_steps} steps ({warmup_type})")
 
         print_log(f"  - Main phase: {main_steps} steps")
 
         if cooldown_steps > 0:
-            final_lr_ratio = lr_scheduler_config.get('final_lr_ratio', 0.1)
+            final_lr_ratio = lr_scheduler_config.get("final_lr_ratio", 0.1)
             print_log(f"  - Cooldown: {cooldown_steps} steps (final LR ratio: {final_lr_ratio})")
 
         # Log phase boundaries
@@ -1125,10 +1219,12 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             print_log(f"  - Phase boundaries: {', '.join(phases)}")
     else:
         # Legacy behavior
-        lr_warmup_steps = warmup_config.get('lr_warmup_steps', 0)
+        lr_warmup_steps = warmup_config.get("lr_warmup_steps", 0)
         if lr_warmup_steps > 0:
-            print_log(f"Learning rate warmup: enabled for {lr_warmup_steps} steps (linearly increasing from 0 to 1)")
-            cooldown_start = int(train_steps * (1 - training_config['cooldown_frac']))
+            print_log(
+                f"Learning rate warmup: enabled for {lr_warmup_steps} steps (linearly increasing from 0 to 1)"
+            )
+            cooldown_start = int(train_steps * (1 - training_config["cooldown_frac"]))
             print_log(f"  - Warmup phase: steps 0-{lr_warmup_steps-1}")
             print_log(f"  - Stable phase: steps {lr_warmup_steps}-{cooldown_start-1}")
             print_log(f"  - Cooldown phase: steps {cooldown_start}-{train_steps}")
@@ -1138,15 +1234,15 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     # Prepare checkpoint directory.
     # Periodic checkpoints write under output_dir/checkpoints/<timestamp>.
     # Final-only checkpoints keep legacy checkpoint_root/date/run_id behavior.
-    ckpt_every = int(training_config.get('checkpoint_every', 0) or 0)
+    ckpt_every = int(training_config.get("checkpoint_every", 0) or 0)
     ckpt_dir = None
     if ckpt_every > 0:
         ckpt_timestamp = time.strftime("%Y%m%d_%H%M%S")
         ckpt_dir = os.path.join(output_dir, "checkpoints", ckpt_timestamp)
         os.makedirs(ckpt_dir, exist_ok=True)
         print_log(f"Periodic checkpointing enabled: every {ckpt_every} step(s) -> {ckpt_dir}")
-    elif training_config.get('save_checkpoint', False):
-        ckpt_root = training_config.get('checkpoint_root', 'checkpoints')
+    elif training_config.get("save_checkpoint", False):
+        ckpt_root = training_config.get("checkpoint_root", "checkpoints")
         date_str = time.strftime("%Y-%m-%d")
         ckpt_dir = os.path.join(ckpt_root, date_str, str(run_id))
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -1166,21 +1262,21 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         # --------------- VALIDATION SECTION -----------------
         if last_step or (
-            training_config['val_loss_every'] > 0
-            and (step == 0 or step % training_config['val_loss_every'] == 0)
+            training_config["val_loss_every"] > 0
+            and (step == 0 or step % training_config["val_loss_every"] == 0)
         ):
             # stop the clock
             torch.cuda.synchronize()
-            training_time_s += (time.perf_counter() - t0)
+            training_time_s += time.perf_counter() - t0
             model.eval()
             # For validation, we don't need gradient accumulation
-            val_batch_size = data_config['val_seq_len']
-            assert data_config['val_tokens'] % val_batch_size == 0
-            val_steps = data_config['val_tokens'] // val_batch_size
+            val_batch_size = data_config["val_seq_len"]
+            assert data_config["val_tokens"] % val_batch_size == 0
+            val_steps = data_config["val_tokens"] // val_batch_size
             val_loader = single_gpu_data_generator(
-                data_config['val_files'],
-                data_config['val_seq_len'],
-                data_config['val_seq_len'],
+                data_config["val_files"],
+                data_config["val_seq_len"],
+                data_config["val_seq_len"],
                 align_to_bos=False,
             )
             val_loss = 0
@@ -1188,23 +1284,29 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             with torch.no_grad():
                 for _ in range(val_steps):
                     inputs, targets = next(val_loader)
-                    if model_type == 'gpt':
+                    if model_type == "gpt":
                         val_loss += model(inputs, targets, get_window_size_blocks(step))
                     else:
-                        outputs = model(input_ids=inputs[None, :].to(torch.int64), labels=targets[None, :].to(torch.int64))
+                        outputs = model(
+                            input_ids=inputs[None, :].to(torch.int64),
+                            labels=targets[None, :].to(torch.int64),
+                        )
                         val_loss += outputs.loss.item()
-                    val_tokens_this_step += data_config['val_seq_len']
+                    val_tokens_this_step += data_config["val_seq_len"]
             val_loss /= val_steps
             total_tokens_processed += val_tokens_this_step
             del val_loader
 
-            print_log(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} grad_accum:{get_grad_accum_steps_managed(step)} train_time:{training_time_s:.2f}s step_avg:{training_time_s/max(step, 1):.2f}s", console=True)
+            print_log(
+                f"step:{step}/{train_steps} val_loss:{val_loss:.4f} grad_accum:{get_grad_accum_steps_managed(step)} train_time:{training_time_s:.2f}s step_avg:{training_time_s/max(step, 1):.2f}s",
+                console=True,
+            )
 
             # Calculate tokens per second based on total training time
             tokens_per_sec = train_tokens_processed / max(training_time_s, 1e-6)
 
             # Log to wandb
-            if logging_config['use_wandb']:
+            if logging_config["use_wandb"]:
                 if first_train_step_time_s is None:
                     train_time_s_zero = 0.0
                     train_tokens_processed_for_plot = 0
@@ -1218,14 +1320,21 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                     "val_loss": val_loss,
                     "train_time_s": train_time_s_zero,
                     "train_time_s_abs": training_time_s,
-                    "step_avg_s": training_time_s/max(step, 1),
+                    "step_avg_s": training_time_s / max(step, 1),
                     "learning_rate": optimizers[0].param_groups[0]["lr"],
                     "muon_lr": optimizers[1].param_groups[0]["lr"] if len(optimizers) > 1 else None,
-                    "muon_momentum": optimizers[1].param_groups[0]["momentum"] if len(optimizers) > 1 else None,
-                    "window_size_blocks": get_window_size_blocks(step).item() if model_type == 'gpt' else None,
-                    "window_size": training_manager.get_window_size(step) if model_type == 'gpt' else None,
+                    "muon_momentum": (
+                        optimizers[1].param_groups[0]["momentum"] if len(optimizers) > 1 else None
+                    ),
+                    "window_size_blocks": (
+                        get_window_size_blocks(step).item() if model_type == "gpt" else None
+                    ),
+                    "window_size": (
+                        training_manager.get_window_size(step) if model_type == "gpt" else None
+                    ),
                     "grad_accum_steps": get_grad_accum_steps_managed(step),
-                    "effective_batch_size": get_grad_accum_steps_managed(step) * train_micro_batch_tokens,
+                    "effective_batch_size": get_grad_accum_steps_managed(step)
+                    * train_micro_batch_tokens,
                     "tokens_processed": train_tokens_processed_for_plot,
                     "total_tokens_processed": total_tokens_processed,
                     "train_tokens_processed_abs": train_tokens_processed,
@@ -1246,9 +1355,17 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         if last_step:
             # Log early stopping message if applicable
             if args.early_stop_steps is not None and step >= args.early_stop_steps:
-                print_log(f"Early stopping at step {step} (requested: {args.early_stop_steps})", console=True)
-            if training_config['save_checkpoint']:
-                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                print_log(
+                    f"Early stopping at step {step} (requested: {args.early_stop_steps})",
+                    console=True,
+                )
+            if training_config["save_checkpoint"]:
+                log = dict(
+                    step=step,
+                    code=code,
+                    model=model.state_dict(),
+                    optimizers=[opt.state_dict() for opt in optimizers],
+                )
                 save_path = os.path.join(ckpt_dir or output_dir, f"state_step{step:06d}.pt")
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 torch.save(log, save_path)
@@ -1263,14 +1380,17 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         for micro_step in range(grad_accum_steps):
             inputs, targets = next(train_loader)
-            if model_type == 'gpt':
+            if model_type == "gpt":
                 loss = model(inputs, targets, get_window_size_blocks(step))
                 # Match train_gpt.py: loss is summed over tokens, scale only by grad_accum_steps
                 # so the gradient corresponds to the total token loss per iteration.
                 train_loss_accum += loss.detach()
                 loss = loss / grad_accum_steps
             else:
-                outputs = model(input_ids=inputs[None, :].to(torch.int64), labels=targets[None, :].to(torch.int64))
+                outputs = model(
+                    input_ids=inputs[None, :].to(torch.int64),
+                    labels=targets[None, :].to(torch.int64),
+                )
                 train_loss_accum += outputs.loss.detach()
                 loss = outputs.loss / grad_accum_steps
             loss.backward()
@@ -1280,62 +1400,66 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         # Calculate gradient norms before clipping (for logging)
         grad_norm_before = None
-        if logging_config['use_wandb'] or grad_clip_norm is not None:
+        if logging_config["use_wandb"] or grad_clip_norm is not None:
             grad_norm_dict = {}
 
             with torch.no_grad():
-                for param_group_name, params in [("hidden_matrix", hidden_matrix_params),
-                                                    ("embed", embed_params),
-                                                    ("scalar", scalar_params),
-                                                    ("head", head_params)]:
+                for param_group_name, params in [
+                    ("hidden_matrix", hidden_matrix_params),
+                    ("embed", embed_params),
+                    ("scalar", scalar_params),
+                    ("head", head_params),
+                ]:
                     total_norm = 0.0
                     for p in params:
                         if p.grad is not None:
                             param_norm = p.grad.data.norm(2)
                             total_norm += param_norm.item() ** 2
-                    grad_norm_dict[f"grad_norm_{param_group_name}"] = total_norm ** 0.5
+                    grad_norm_dict[f"grad_norm_{param_group_name}"] = total_norm**0.5
                 # Calculate total gradient norm for clipping
                 total_norm = 0.0
                 for p in model.parameters():
                     if p.grad is not None:
                         param_norm = p.grad.data.norm(2)
                         total_norm += param_norm.item() ** 2
-                grad_norm_before = total_norm ** 0.5
+                grad_norm_before = total_norm**0.5
                 grad_norm_dict["grad_norm_total"] = grad_norm_before
-
 
         # Apply gradient clipping if configured
         grad_norm_after = None
         if grad_clip_norm is not None:
             # Clip gradients by L2 norm
             grad_norm_after = nn_utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            if logging_config['use_wandb']:
+            if logging_config["use_wandb"]:
                 grad_norm_dict["grad_norm_clipped"] = grad_norm_after
-                grad_norm_dict["grad_clip_ratio"] = min(1.0, grad_clip_norm / grad_norm_before) if grad_norm_before > 0 else 1.0
+                grad_norm_dict["grad_clip_ratio"] = (
+                    min(1.0, grad_clip_norm / grad_norm_before) if grad_norm_before > 0 else 1.0
+                )
 
         # set optimization hyperparameters
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * get_lr(step)
 
-
-
         if len(optimizers) > 1:
             # Apply momentum warmup and cooldown for NorMuon optimizer
             # Following train_gpt.py get_muon_momentum schedule
-            muon_cfg = optimizer_config.get('muon', {
-                'momentum': 0.95,
-                'momentum_min': 0.85,
-                'momentum_warmup_frac': 0.144,   # 300/2090 from train_gpt.py
-                'momentum_cooldown_frac': 0.024, # 50/2090 from train_gpt.py
-            })
-            momentum_max = muon_cfg.get('momentum', 0.95)
-            momentum_min = muon_cfg.get('momentum_min', 0.85)
-            num_iterations = training_config['num_iterations']
+            muon_cfg = optimizer_config.get(
+                "muon",
+                {
+                    "momentum": 0.95,
+                    "momentum_min": 0.85,
+                    "momentum_warmup_frac": 0.144,  # 300/2090 from train_gpt.py
+                    "momentum_cooldown_frac": 0.024,  # 50/2090 from train_gpt.py
+                },
+            )
+            momentum_max = muon_cfg.get("momentum", 0.95)
+            momentum_min = muon_cfg.get("momentum_min", 0.85)
+            num_iterations = training_config["num_iterations"]
 
             # Compute warmup and cooldown steps from fractions
-            warmup_steps = int(muon_cfg.get('momentum_warmup_frac', 0.15) * num_iterations)
-            cooldown_steps = int(muon_cfg.get('momentum_cooldown_frac', 0.025) * num_iterations)
+            warmup_steps = int(muon_cfg.get("momentum_warmup_frac", 0.15) * num_iterations)
+            cooldown_steps = int(muon_cfg.get("momentum_cooldown_frac", 0.025) * num_iterations)
             cooldown_start = num_iterations - cooldown_steps
 
             # Compute momentum with warmup and cooldown
@@ -1359,7 +1483,12 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         # Periodic checkpointing
         if ckpt_every > 0 and (step + 1) % ckpt_every == 0:
-            log = dict(step=step + 1, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            log = dict(
+                step=step + 1,
+                code=code,
+                model=model.state_dict(),
+                optimizers=[opt.state_dict() for opt in optimizers],
+            )
             save_path = os.path.join(ckpt_dir or output_dir, f"state_step{step + 1:06d}.pt")
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(log, save_path)
@@ -1372,14 +1501,17 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         # Determine if we should show lr_mult in logging
         if lr_scheduler_config is not None:
-            warmup_steps = lr_scheduler_config.get('warmup_steps', 0)
+            warmup_steps = lr_scheduler_config.get("warmup_steps", 0)
             show_lr_info = warmup_steps > 0 and step < warmup_steps
         else:
-            warmup_steps = warmup_config.get('lr_warmup_steps', 0)
+            warmup_steps = warmup_config.get("lr_warmup_steps", 0)
             show_lr_info = warmup_steps > 0 and step < warmup_steps
 
         lr_info = f" lr_mult:{lr_mult:.3f}" if show_lr_info else ""
-        print_log(f"step:{step+1}/{train_steps} train_loss:{train_loss_per_token:.4f}{lr_info} grad_accum:{grad_accum_steps} batch_size:{effective_batch_size} train_time:{approx_training_time_s:.2f}s step_avg:{approx_training_time_s/(step + 1):.2f}s", console=True)
+        print_log(
+            f"step:{step+1}/{train_steps} train_loss:{train_loss_per_token:.4f}{lr_info} grad_accum:{grad_accum_steps} batch_size:{effective_batch_size} train_time:{approx_training_time_s:.2f}s step_avg:{approx_training_time_s/(step + 1):.2f}s",
+            console=True,
+        )
 
         # Calculate tokens per second for training steps too
         approx_training_time_s = training_time_s + (time.perf_counter() - t0)
@@ -1388,24 +1520,36 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             first_train_step_time_s = approx_training_time_s
             first_train_tokens_processed = train_tokens_processed
         train_time_s_zero = max(0.0, approx_training_time_s - first_train_step_time_s)
-        train_tokens_processed_for_plot = max(0, train_tokens_processed - (first_train_tokens_processed or 0))
-        train_step_time_s = 0.0 if prev_train_step_time_s is None else max(0.0, approx_training_time_s - prev_train_step_time_s)
+        train_tokens_processed_for_plot = max(
+            0, train_tokens_processed - (first_train_tokens_processed or 0)
+        )
+        train_step_time_s = (
+            0.0
+            if prev_train_step_time_s is None
+            else max(0.0, approx_training_time_s - prev_train_step_time_s)
+        )
         prev_train_step_time_s = approx_training_time_s
 
         # Log training metrics to wandb
-        if logging_config['use_wandb']:
+        if logging_config["use_wandb"]:
             log_dict = {
                 "train_loss": train_loss_per_token,
                 "train_time_s": train_time_s_zero,
                 "train_time_s_abs": approx_training_time_s,
                 "train_time_s_zero": train_time_s_zero,
                 "train_step_time_s": train_step_time_s,
-                "step_avg_s": approx_training_time_s/(step + 1),
+                "step_avg_s": approx_training_time_s / (step + 1),
                 "learning_rate": optimizers[0].param_groups[0]["lr"],
                 "muon_lr": optimizers[1].param_groups[0]["lr"] if len(optimizers) > 1 else None,
-                "muon_momentum": optimizers[1].param_groups[0]["momentum"] if len(optimizers) > 1 else None,
-                "window_size_blocks": get_window_size_blocks(step).item() if model_type == 'gpt' else None,
-                "window_size": training_manager.get_window_size(step) if model_type == 'gpt' else None,
+                "muon_momentum": (
+                    optimizers[1].param_groups[0]["momentum"] if len(optimizers) > 1 else None
+                ),
+                "window_size_blocks": (
+                    get_window_size_blocks(step).item() if model_type == "gpt" else None
+                ),
+                "window_size": (
+                    training_manager.get_window_size(step) if model_type == "gpt" else None
+                ),
                 "lr_multiplier": get_lr(step),
                 "grad_accum_steps": grad_accum_steps,
                 "effective_batch_size": effective_batch_size,
@@ -1418,22 +1562,26 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
             log_dict.update(grad_norm_dict)
 
-            wandb.log(log_dict, step=step+1)
+            wandb.log(log_dict, step=step + 1)
 
     peak_memory = torch.cuda.max_memory_allocated() // 1024 // 1024
     reserved_memory = torch.cuda.max_memory_reserved() // 1024 // 1024
-    print_log(f"peak memory allocated: {peak_memory} MiB reserved: {reserved_memory} MiB", console=True)
+    print_log(
+        f"peak memory allocated: {peak_memory} MiB reserved: {reserved_memory} MiB", console=True
+    )
 
     # Calculate final tokens per second
     final_tokens_per_sec = train_tokens_processed / max(training_time_s, 1e-6)
 
     # Log final metrics and finish wandb
-    if logging_config['use_wandb']:
-        wandb.log({
-            "peak_memory_MiB": peak_memory,
-            "reserved_memory_MiB": reserved_memory,
-            "final_train_tokens_processed": train_tokens_processed,
-            "final_total_tokens_processed": total_tokens_processed,
-            "final_tokens_per_sec": final_tokens_per_sec,
-        })
+    if logging_config["use_wandb"]:
+        wandb.log(
+            {
+                "peak_memory_MiB": peak_memory,
+                "reserved_memory_MiB": reserved_memory,
+                "final_train_tokens_processed": train_tokens_processed,
+                "final_total_tokens_processed": total_tokens_processed,
+                "final_tokens_per_sec": final_tokens_per_sec,
+            }
+        )
         wandb.finish()

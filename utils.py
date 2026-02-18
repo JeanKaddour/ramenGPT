@@ -10,42 +10,42 @@ import subprocess
 def detect_gpu_architecture():
     """Detect GPU architecture before importing torch."""
     gpu_info = {
-        'name': 'unknown',
-        'compute_capability': None,
-        'architecture': 'unknown',
-        'shared_memory_per_block': None,
+        "name": "unknown",
+        "compute_capability": None,
+        "architecture": "unknown",
+        "shared_memory_per_block": None,
     }
 
     try:
         result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=name,compute_cap', '--format=csv,noheader,nounits'],
+            ["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
             timeout=10,
         )
         if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
+            lines = result.stdout.strip().split("\n")
             if lines and lines[0]:
-                parts = lines[0].split(',')
-                gpu_info['name'] = parts[0].strip() if len(parts) > 0 else 'unknown'
+                parts = lines[0].split(",")
+                gpu_info["name"] = parts[0].strip() if len(parts) > 0 else "unknown"
                 if len(parts) > 1:
                     cc = parts[1].strip()
-                    gpu_info['compute_capability'] = cc
+                    gpu_info["compute_capability"] = cc
 
-                    major = int(cc.split('.')[0]) if '.' in cc else int(cc)
+                    major = int(cc.split(".")[0]) if "." in cc else int(cc)
                     if major >= 10:
-                        gpu_info['architecture'] = 'blackwell'
+                        gpu_info["architecture"] = "blackwell"
                     elif major >= 9:
-                        gpu_info['architecture'] = 'hopper'
+                        gpu_info["architecture"] = "hopper"
                     elif major >= 8:
-                        if cc.startswith('8.9'):
-                            gpu_info['architecture'] = 'ada'
+                        if cc.startswith("8.9"):
+                            gpu_info["architecture"] = "ada"
                         else:
-                            gpu_info['architecture'] = 'ampere'
+                            gpu_info["architecture"] = "ampere"
                     elif major >= 7:
-                        gpu_info['architecture'] = 'volta_turing'
+                        gpu_info["architecture"] = "volta_turing"
                     else:
-                        gpu_info['architecture'] = 'legacy'
+                        gpu_info["architecture"] = "legacy"
     except Exception as exc:
         print(f"Warning: Could not detect GPU via nvidia-smi: {exc}")
 
@@ -60,46 +60,46 @@ def setup_gpu_environment():
         f"architecture: {gpu_info['architecture']})"
     )
 
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-    os.environ['TRITON_CACHE_DIR'] = '/tmp/triton_cache'
-    os.environ['TORCH_INDUCTOR_FORCE_DISABLE_CACHES'] = '1'
-    os.environ['FLA_CONV_BACKEND'] = 'triton'
-    os.environ['TRITON_AUTOTUNE'] = '0'
-    os.environ['TORCHINDUCTOR_CACHE_DIR'] = '/tmp/inductor_cache'
-    os.environ['PYTORCH_DISABLE_CUDA_GRAPHS'] = '1'
-    os.environ['TRITON_DEFAULT_NUM_STAGES'] = '1'
-    os.environ['TRITON_DEFAULT_NUM_WARPS'] = '4'
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["TRITON_CACHE_DIR"] = "/tmp/triton_cache"
+    os.environ["TORCH_INDUCTOR_FORCE_DISABLE_CACHES"] = "1"
+    os.environ["FLA_CONV_BACKEND"] = "triton"
+    os.environ["TRITON_AUTOTUNE"] = "0"
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/inductor_cache"
+    os.environ["PYTORCH_DISABLE_CUDA_GRAPHS"] = "1"
+    os.environ["TRITON_DEFAULT_NUM_STAGES"] = "1"
+    os.environ["TRITON_DEFAULT_NUM_WARPS"] = "4"
 
-    if gpu_info['architecture'] == 'ampere':
-        os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6'
-        os.environ['TRITON_MAX_SHARED_MEMORY'] = '100000'
-        os.environ['TRITON_NUM_STAGES'] = '1'
-        os.environ['TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE'] = 'EXHAUSTIVE'
-        os.environ['TORCH_INDUCTOR_DEFAULT_NUM_STAGES'] = '1'
-        os.environ['INDUCTOR_TRITON_NUM_STAGES'] = '1'
-        print('  -> Configured for Ampere architecture (RTX 30 series)')
+    if gpu_info["architecture"] == "ampere":
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"
+        os.environ["TRITON_MAX_SHARED_MEMORY"] = "100000"
+        os.environ["TRITON_NUM_STAGES"] = "1"
+        os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE"] = "EXHAUSTIVE"
+        os.environ["TORCH_INDUCTOR_DEFAULT_NUM_STAGES"] = "1"
+        os.environ["INDUCTOR_TRITON_NUM_STAGES"] = "1"
+        print("  -> Configured for Ampere architecture (RTX 30 series)")
 
-    elif gpu_info['architecture'] == 'ada':
-        os.environ['TORCH_CUDA_ARCH_LIST'] = '8.9'
-        os.environ['TRITON_MAX_SHARED_MEMORY'] = '164000'
-        print('  -> Configured for Ada Lovelace architecture (RTX 40 series)')
+    elif gpu_info["architecture"] == "ada":
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
+        os.environ["TRITON_MAX_SHARED_MEMORY"] = "164000"
+        print("  -> Configured for Ada Lovelace architecture (RTX 40 series)")
 
-    elif gpu_info['architecture'] == 'blackwell':
-        if gpu_info['compute_capability']:
-            os.environ['TORCH_CUDA_ARCH_LIST'] = gpu_info['compute_capability']
-        os.environ['TRITON_MAX_SHARED_MEMORY'] = '228000'
-        os.environ['TRITON_NUM_STAGES'] = '1'
-        os.environ['TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE'] = 'EXHAUSTIVE'
-        os.environ['TORCH_INDUCTOR_DEFAULT_NUM_STAGES'] = '1'
-        os.environ['INDUCTOR_TRITON_NUM_STAGES'] = '1'
-        print('  -> Configured for Blackwell architecture (RTX 50 series)')
+    elif gpu_info["architecture"] == "blackwell":
+        if gpu_info["compute_capability"]:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = gpu_info["compute_capability"]
+        os.environ["TRITON_MAX_SHARED_MEMORY"] = "228000"
+        os.environ["TRITON_NUM_STAGES"] = "1"
+        os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE"] = "EXHAUSTIVE"
+        os.environ["TORCH_INDUCTOR_DEFAULT_NUM_STAGES"] = "1"
+        os.environ["INDUCTOR_TRITON_NUM_STAGES"] = "1"
+        print("  -> Configured for Blackwell architecture (RTX 50 series)")
 
-    elif gpu_info['architecture'] == 'hopper':
-        os.environ['TORCH_CUDA_ARCH_LIST'] = '9.0'
-        os.environ['TRITON_MAX_SHARED_MEMORY'] = '228000'
-        print('  -> Configured for Hopper architecture (H100, etc.)')
+    elif gpu_info["architecture"] == "hopper":
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+        os.environ["TRITON_MAX_SHARED_MEMORY"] = "228000"
+        print("  -> Configured for Hopper architecture (H100, etc.)")
     else:
-        print('  -> Using auto-detection for unknown architecture')
+        print("  -> Using auto-detection for unknown architecture")
 
     return gpu_info
 
@@ -117,31 +117,30 @@ def configure_torch_runtime(gpu_info: dict):
     inductor_config.triton.descriptive_names = False
     inductor_config.triton.cudagraphs = False
 
-    if gpu_info.get('architecture') in ('blackwell', 'ampere'):
+    if gpu_info.get("architecture") in ("blackwell", "ampere"):
         inductor_config.fallback_random = True
         inductor_config.force_disable_caches = True
         inductor_config.compile_threads = 1
-        if hasattr(inductor_config, 'worker_start_method'):
-            inductor_config.worker_start_method = 'fork'
-        if hasattr(inductor_config, 'triton'):
-            if hasattr(inductor_config.triton, 'num_stages'):
+        if hasattr(inductor_config, "worker_start_method"):
+            inductor_config.worker_start_method = "fork"
+        if hasattr(inductor_config, "triton"):
+            if hasattr(inductor_config.triton, "num_stages"):
                 inductor_config.triton.num_stages = 1
-            if hasattr(inductor_config.triton, 'num_warps'):
+            if hasattr(inductor_config.triton, "num_warps"):
                 inductor_config.triton.num_warps = 4
         print(f"  -> Applied conservative inductor settings for {gpu_info.get('architecture')}")
 
     torch._dynamo.config.suppress_errors = True
     torch._dynamo.config.cache_size_limit = 256
-    if gpu_info.get('architecture') in ('ampere', 'blackwell'):
+    if gpu_info.get("architecture") in ("ampere", "blackwell"):
         torch._dynamo.config.assume_static_by_default = True
-        if hasattr(torch._dynamo.config, 'automatic_dynamic_shapes'):
+        if hasattr(torch._dynamo.config, "automatic_dynamic_shapes"):
             torch._dynamo.config.automatic_dynamic_shapes = False
-
 
 
 def patch_triton_shared_memory(gpu_info: dict):
     """Work around Triton blackwell shared-memory reporting bugs."""
-    if gpu_info.get('architecture') != 'blackwell':
+    if gpu_info.get("architecture") != "blackwell":
         return
 
     blackwell_shared_mem = 228000
@@ -152,9 +151,9 @@ def patch_triton_shared_memory(gpu_info: dict):
 
         def patched_get_device_properties(device_id):
             props = original_get_device_properties(device_id)
-            if props.get('max_shared_mem', 0) < 200000:
+            if props.get("max_shared_mem", 0) < 200000:
                 props = dict(props)
-                props['max_shared_mem'] = blackwell_shared_mem
+                props["max_shared_mem"] = blackwell_shared_mem
             return props
 
         driver.active.utils.get_device_properties = patched_get_device_properties
@@ -163,17 +162,19 @@ def patch_triton_shared_memory(gpu_info: dict):
 
         def patched_max_shared_mem(device):
             props = patched_get_device_properties(device)
-            return props['max_shared_mem']
+            return props["max_shared_mem"]
 
         triton_compiler.max_shared_mem = patched_max_shared_mem
-        print(f"  -> Patched Triton shared memory detection for Blackwell ({blackwell_shared_mem} bytes)")
+        print(
+            f"  -> Patched Triton shared memory detection for Blackwell ({blackwell_shared_mem} bytes)"
+        )
     except Exception as exc:
         print(f"  -> Warning: Could not patch Triton shared memory: {exc}")
 
 
 def load_config(config_path):
     """Load configuration from a Python module path."""
-    spec = importlib.util.spec_from_file_location('config', config_path)
+    spec = importlib.util.spec_from_file_location("config", config_path)
     config_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(config_module)
     return config_module

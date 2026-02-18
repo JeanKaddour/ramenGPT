@@ -1,8 +1,6 @@
 import torch
 
 
-
-
 @torch.compile(dynamic=False, fullgraph=True)
 def polar_express(G: torch.Tensor):
     """Polar Express sign method for orthogonalization."""
@@ -52,6 +50,7 @@ class AdamSingleGPU(torch.optim.Optimizer):
     Adam optimizer matching train_gpt.py DistAdam behavior.
     Uses lr_mul but NOT shape_mult for learning rate (DistAdam doesn't use shape scaling).
     """
+
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
@@ -59,36 +58,36 @@ class AdamSingleGPU(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            beta1, beta2 = group['betas']
-            eps = group['eps']
-            wd = group['weight_decay']
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
 
-            for p in group['params']:
+            for p in group["params"]:
                 if p.grad is None:
                     continue
 
-                lr = group['lr'] * getattr(p, 'lr_mul', 1.0)
+                lr = group["lr"] * getattr(p, "lr_mul", 1.0)
                 grad = p.grad
                 state = self.state[p]
                 if len(state) == 0:
-                    state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p)
-                    state['exp_avg_sq'] = torch.zeros_like(p)
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
 
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                state['step'] += 1
-                t = state['step']
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                state["step"] += 1
+                t = state["step"]
 
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-                bias1 = 1 - beta1 ** t
-                bias2 = 1 - beta2 ** t
+                bias1 = 1 - beta1**t
+                bias2 = 1 - beta2**t
                 denom = exp_avg_sq.sqrt().add_(eps)
-                step_size = lr * (bias2 ** 0.5 / bias1)
+                step_size = lr * (bias2**0.5 / bias1)
                 update = exp_avg.div(denom).mul_(step_size)
 
-                wd_mul = getattr(p, 'wd_mul', 1.0)
+                wd_mul = getattr(p, "wd_mul", 1.0)
                 eff_weight_decay = lr * wd * wd_mul
                 if eff_weight_decay != 0:
                     mask = (update * p) > 0
@@ -101,42 +100,45 @@ class NorMuonSingleGPU(torch.optim.Optimizer):
     """
     NorMuon - MomentUm Orthogonalized by Newton-schulz with variance reduction
     """
+
     def __init__(self, params, lr=0.02, momentum=0.95, beta2=0.95, weight_decay=0.0, nesterov=True):
-        defaults = dict(lr=lr, momentum=momentum, beta2=beta2, weight_decay=weight_decay, nesterov=nesterov)
+        defaults = dict(
+            lr=lr, momentum=momentum, beta2=beta2, weight_decay=weight_decay, nesterov=nesterov
+        )
         super().__init__(params, defaults)
 
     def reset(self):
         for group in self.param_groups:
-            for p in group['params']:
+            for p in group["params"]:
                 state = self.state[p]
-                if 'momentum_buffer' in state:
-                    state['momentum_buffer'].zero_()
-                if 'second_momentum_buffer' in state:
-                    state['second_momentum_buffer'].zero_()
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].zero_()
+                if "second_momentum_buffer" in state:
+                    state["second_momentum_buffer"].zero_()
 
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            lr = group['lr']
-            wd = group['weight_decay']
-            beta2 = group['beta2']
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            beta2 = group["beta2"]
 
-            for p in group['params']:
+            for p in group["params"]:
                 if p.grad is None:
                     continue
 
                 g = p.grad
                 state = self.state[p]
-                if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(g)
-                buf = state['momentum_buffer']
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
 
-                buf.lerp_(g, 1 - group['momentum'])
-                g = g.lerp_(buf, group['momentum']) if group['nesterov'] else buf
+                buf.lerp_(g, 1 - group["momentum"])
+                g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
 
                 g = polar_express(g)
 
-                is_gate = 'gate' in getattr(p, 'label', '')
+                is_gate = "gate" in getattr(p, "label", "")
                 param_shape = p.shape
                 if is_gate or param_shape[-2] >= param_shape[-1]:
                     red_dim = -1
@@ -145,16 +147,18 @@ class NorMuonSingleGPU(torch.optim.Optimizer):
                     red_dim = -2
                     buffer_shape = (*g.shape[:-2], 1, g.shape[-1])
 
-                if 'second_momentum_buffer' not in state:
-                    state['second_momentum_buffer'] = torch.zeros(buffer_shape, dtype=g.dtype, device=g.device)
-                second_momentum_buffer = state['second_momentum_buffer']
+                if "second_momentum_buffer" not in state:
+                    state["second_momentum_buffer"] = torch.zeros(
+                        buffer_shape, dtype=g.dtype, device=g.device
+                    )
+                second_momentum_buffer = state["second_momentum_buffer"]
 
                 g = apply_normuon_variance_reduction(g, second_momentum_buffer, beta2, red_dim)
 
                 shape_mult = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
-                eff_lr = lr * shape_mult * getattr(p, 'lr_mul', 1.0)
+                eff_lr = lr * shape_mult * getattr(p, "lr_mul", 1.0)
 
-                wd_mul = getattr(p, 'wd_mul', 1.0)
+                wd_mul = getattr(p, "wd_mul", 1.0)
                 eff_wd = wd_mul * wd * lr
                 mask = (g * p) >= 0
                 if eff_wd != 0:
