@@ -1,9 +1,4 @@
 import os
-
-# Tiny single-GPU GPT config optimized for fast convergence checks.
-# Targets a few-minute run and is compatible with train_gpt_single_gpu_tiny.py.
-
-# Model architecture (tiny but still modern)
 model_config = dict(
     vocab_size=50257,
     num_layers=6,
@@ -26,7 +21,6 @@ model_config = dict(
     logits_softcap_divisor=7.5,
 )
 
-# Modern architecture knobs
 gating_config = dict(
     use_attn_gate=True,
     use_value_embed_gate=True,
@@ -101,6 +95,7 @@ training_config = dict(
 
 optimizer_config = dict(
     use_muon=True,
+    matrix_optimizer="muon",  # "muon", "aro", or "bam"
     adam=dict(
         lr=0.006,
         betas=(0.65, 0.95),
@@ -122,6 +117,26 @@ optimizer_config = dict(
         momentum_cooldown_frac=0.10,
         beta2=0.95,
         nesterov=True,
+    ),
+    aro=dict(
+        lr=0.02,
+        weight_decay=1.2,
+        momentum=0.95,
+        momentum_min=0.85,
+        momentum_warmup_frac=0.10,
+        momentum_cooldown_frac=0.10,
+        nesterov=True,
+        sinkhorn_iters=5,
+    ),
+    bam=dict(
+        lr=0.02,
+        weight_decay=1.2,
+        momentum=0.95,
+        momentum_min=0.85,
+        momentum_warmup_frac=0.10,
+        momentum_cooldown_frac=0.10,
+        nesterov=True,
+        sink_steps=1,
     ),
     lr_multipliers=dict(
         embed=1.0,

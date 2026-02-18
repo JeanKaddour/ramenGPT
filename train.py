@@ -14,7 +14,7 @@ from torch import Tensor, nn
 import torch.nn.utils as nn_utils
 
 from model import GPT, next_multiple_of_n, set_flex_attention_kernel_options
-from optimizers import AdamSingleGPU, NorMuonSingleGPU
+from optimizers import Adam, AROSinkhorn, BAM, NorMuon
 import wandb
 
 
@@ -622,7 +622,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                 }
             )
 
-        optimizer1 = AdamSingleGPU(adam_param_groups)
+        optimizer1 = Adam(adam_param_groups)
 
         # Separate scalar optimizer with higher momentum (from train_gpt.py)
         scalar_param_groups = []
@@ -637,33 +637,81 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                     "weight_decay": scalar_adam_cfg.get("weight_decay", 0.0),  # No WD on scalars
                 }
             )
-            scalar_opt = AdamSingleGPU(scalar_param_groups)
+            scalar_opt = Adam(scalar_param_groups)
             print(f"Created separate scalar optimizer for {len(all_scalar_params)} parameters")
 
-        muon_cfg = optimizer_config.get(
-            "muon",
-            {
-                "lr": 0.02,
-                "momentum": 0.95,
-                "momentum_min": 0.85,
-                "momentum_warmup_frac": 0.144,  # 300/2090 from train_gpt.py
-                "momentum_cooldown_frac": 0.024,  # 50/2090 from train_gpt.py
-                "beta2": 0.95,
-                "nesterov": True,
-            },
-        )
-        optimizer2 = NorMuonSingleGPU(
-            hidden_matrix_params,
-            lr=muon_cfg["lr"],
-            momentum=muon_cfg["momentum"],
-            beta2=muon_cfg.get("beta2", 0.95),
-            weight_decay=muon_cfg.get("weight_decay", 0.0),
-            nesterov=muon_cfg.get("nesterov", True),
-        )
+        matrix_optimizer_type = optimizer_config.get("matrix_optimizer", "muon")
+
+        if matrix_optimizer_type == "aro":
+            aro_cfg = optimizer_config.get(
+                "aro",
+                {
+                    "lr": 0.02,
+                    "momentum": 0.95,
+                    "momentum_min": 0.85,
+                    "momentum_warmup_frac": 0.10,
+                    "momentum_cooldown_frac": 0.10,
+                    "nesterov": True,
+                    "sinkhorn_iters": 5,
+                },
+            )
+            optimizer2 = AROSinkhorn(
+                hidden_matrix_params,
+                lr=aro_cfg["lr"],
+                momentum=aro_cfg["momentum"],
+                weight_decay=aro_cfg.get("weight_decay", 0.0),
+                nesterov=aro_cfg.get("nesterov", True),
+                sinkhorn_iters=aro_cfg.get("sinkhorn_iters", 5),
+            )
+            print(f"Using ARO-Sinkhorn optimizer for {len(hidden_matrix_params)} matrix parameters")
+        elif matrix_optimizer_type == "bam":
+            bam_cfg = optimizer_config.get(
+                "bam",
+                {
+                    "lr": 0.02,
+                    "momentum": 0.95,
+                    "momentum_min": 0.85,
+                    "momentum_warmup_frac": 0.10,
+                    "momentum_cooldown_frac": 0.10,
+                    "nesterov": True,
+                    "sink_steps": 1,
+                },
+            )
+            optimizer2 = BAM(
+                hidden_matrix_params,
+                lr=bam_cfg["lr"],
+                momentum=bam_cfg["momentum"],
+                weight_decay=bam_cfg.get("weight_decay", 0.0),
+                nesterov=bam_cfg.get("nesterov", True),
+                sink_steps=bam_cfg.get("sink_steps", 1),
+            )
+            print(f"Using BAM optimizer for {len(hidden_matrix_params)} matrix parameters")
+        else:
+            muon_cfg = optimizer_config.get(
+                "muon",
+                {
+                    "lr": 0.02,
+                    "momentum": 0.95,
+                    "momentum_min": 0.85,
+                    "momentum_warmup_frac": 0.144,  # 300/2090 from train_gpt.py
+                    "momentum_cooldown_frac": 0.024,  # 50/2090 from train_gpt.py
+                    "beta2": 0.95,
+                    "nesterov": True,
+                },
+            )
+            optimizer2 = NorMuon(
+                hidden_matrix_params,
+                lr=muon_cfg["lr"],
+                momentum=muon_cfg["momentum"],
+                beta2=muon_cfg.get("beta2", 0.95),
+                weight_decay=muon_cfg.get("weight_decay", 0.0),
+                nesterov=muon_cfg.get("nesterov", True),
+            )
+            print(f"Using NorMuon optimizer for {len(hidden_matrix_params)} matrix parameters")
+
         optimizers = [optimizer1, optimizer2]
         if scalar_opt:
             optimizers.append(scalar_opt)
-        print(f"Using Muon optimizer for {len(hidden_matrix_params)} matrix parameters")
 
         # Connect optimizers to TrainingManager
         training_manager.set_optimizers(
@@ -687,7 +735,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                 }
             )
 
-        optimizer1 = AdamSingleGPU(adam_param_groups)
+        optimizer1 = Adam(adam_param_groups)
 
         # Separate scalar optimizer
         all_scalar_params = scalar_params + x0_lambda_params
@@ -701,7 +749,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                     "weight_decay": 0.0,
                 }
             ]
-            scalar_opt = AdamSingleGPU(scalar_param_groups)
+            scalar_opt = Adam(scalar_param_groups)
 
         optimizers = [optimizer1]
         if scalar_opt:
@@ -1442,24 +1490,23 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                 group["lr"] = group["initial_lr"] * get_lr(step)
 
         if len(optimizers) > 1:
-            # Apply momentum warmup and cooldown for NorMuon optimizer
-            # Following train_gpt.py get_muon_momentum schedule
-            muon_cfg = optimizer_config.get(
-                "muon",
-                {
-                    "momentum": 0.95,
-                    "momentum_min": 0.85,
-                    "momentum_warmup_frac": 0.144,  # 300/2090 from train_gpt.py
-                    "momentum_cooldown_frac": 0.024,  # 50/2090 from train_gpt.py
-                },
-            )
-            momentum_max = muon_cfg.get("momentum", 0.95)
-            momentum_min = muon_cfg.get("momentum_min", 0.85)
+            # Apply momentum warmup and cooldown for matrix optimizer (NorMuon or AROSinkhorn)
+            # Read from the active optimizer's config dict
+            matrix_optimizer_type = optimizer_config.get("matrix_optimizer", "muon")
+            default_momentum_cfg = {
+                "momentum": 0.95,
+                "momentum_min": 0.85,
+                "momentum_warmup_frac": 0.10,
+                "momentum_cooldown_frac": 0.10,
+            }
+            matrix_cfg = optimizer_config.get(matrix_optimizer_type, default_momentum_cfg)
+            momentum_max = matrix_cfg.get("momentum", 0.95)
+            momentum_min = matrix_cfg.get("momentum_min", 0.85)
             num_iterations = training_config["num_iterations"]
 
             # Compute warmup and cooldown steps from fractions
-            warmup_steps = int(muon_cfg.get("momentum_warmup_frac", 0.15) * num_iterations)
-            cooldown_steps = int(muon_cfg.get("momentum_cooldown_frac", 0.025) * num_iterations)
+            warmup_steps = int(matrix_cfg.get("momentum_warmup_frac", 0.15) * num_iterations)
+            cooldown_steps = int(matrix_cfg.get("momentum_cooldown_frac", 0.025) * num_iterations)
             cooldown_start = num_iterations - cooldown_steps
 
             # Compute momentum with warmup and cooldown

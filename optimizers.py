@@ -45,7 +45,7 @@ def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red
     return v_chunk.mul_(final_scale.type_as(v_chunk))
 
 
-class AdamSingleGPU(torch.optim.Optimizer):
+class Adam(torch.optim.Optimizer):
     """
     Adam optimizer matching train_gpt.py DistAdam behavior.
     Uses lr_mul but NOT shape_mult for learning rate (DistAdam doesn't use shape scaling).
@@ -96,9 +96,10 @@ class AdamSingleGPU(torch.optim.Optimizer):
                 p.add_(update, alpha=-1.0)
 
 
-class NorMuonSingleGPU(torch.optim.Optimizer):
+class NorMuon(torch.optim.Optimizer):
     """
     NorMuon - MomentUm Orthogonalized by Newton-schulz with variance reduction
+    https://arxiv.org/abs/2510.05491
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, beta2=0.95, weight_decay=0.0, nesterov=True):
@@ -164,3 +165,192 @@ class NorMuonSingleGPU(torch.optim.Optimizer):
                 if eff_wd != 0:
                     p.addcmul_(p, mask, value=-eff_wd * eff_lr)
                 p.add_(g, alpha=-eff_lr)
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def sink_norm(G: torch.Tensor, steps: int = 1):
+    """BAM: alternating row/column L2 normalization.
+    Order depends on matrix shape (tall vs wide) for better conditioning.
+    """
+    for _ in range(steps):
+        if G.shape[-2] > G.shape[-1]:
+            G = G / (torch.linalg.vector_norm(G, ord=2, dim=-1, keepdim=True) + 1e-7)
+            G = G / (torch.linalg.vector_norm(G, ord=2, dim=-2, keepdim=True) + 1e-7)
+        else:
+            G = G / (torch.linalg.vector_norm(G, ord=2, dim=-2, keepdim=True) + 1e-7)
+            G = G / (torch.linalg.vector_norm(G, ord=2, dim=-1, keepdim=True) + 1e-7)
+    return G
+
+
+class BAM(torch.optim.Optimizer):
+    """
+    BAM - Balanced Axis Momentum
+    https://github.com/knightron0/bam
+
+    A simplified variant of Muon that replaces Newton-Schulz orthogonalization
+    with cheap alternating row/column L2 normalization (SinkNorm).
+    O(mn) per step vs O(mn*min(m,n)) for Newton-Schulz.
+    """
+
+    def __init__(self, params, lr=0.02, momentum=0.95, weight_decay=0.0, nesterov=True, sink_steps=1):
+        defaults = dict(
+            lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov, sink_steps=sink_steps
+        )
+        super().__init__(params, defaults)
+
+    def reset(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].zero_()
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            wd = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+
+                buf.lerp_(g, 1 - group["momentum"])
+                g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+
+                g = sink_norm(g, steps=group["sink_steps"])
+
+                shape_mult = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+                eff_lr = lr * shape_mult * getattr(p, "lr_mul", 1.0)
+
+                wd_mul = getattr(p, "wd_mul", 1.0)
+                eff_wd = wd_mul * wd * lr
+                mask = (g * p) >= 0
+                if eff_wd != 0:
+                    p.addcmul_(p, mask, value=-eff_wd * eff_lr)
+                p.add_(g, alpha=-eff_lr)
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def sinkhorn_normalize(X: torch.Tensor, num_iters: int = 5):
+    """SinkGD: simultaneous row and column L2 normalization, iterated."""
+    X = X.float()
+    for _ in range(num_iters):
+        row_norms = X.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        col_norms = X.norm(dim=-2, keepdim=True).clamp_min(1e-8)
+        X = X / row_norms / col_norms
+    return X
+
+
+def shifted_cholesky_qr(A, eps=1e-7):
+    """Shifted Cholesky QR factorization. Falls back to torch.linalg.qr on failure."""
+    A = A.float()
+    m = A.size(-2)
+    P = A.mT @ A + eps * torch.eye(m, device=A.device, dtype=A.dtype)
+    try:
+        L = torch.linalg.cholesky(P)
+        Q = torch.linalg.solve_triangular(L.mT, A.mT, upper=True).mT
+        if not Q.isfinite().all():
+            raise RuntimeError("Non-finite in SCQR")
+        return Q
+    except (RuntimeError, torch.linalg.LinAlgError):
+        Q, _ = torch.linalg.qr(A)
+        return Q
+
+
+class AROSinkhorn(torch.optim.Optimizer):
+    """
+    ARO-Sinkhorn optimizer -- Adaptively Rotated Optimization with Sinkhorn normalization.
+    https://arxiv.org/abs/2502.xxxxx
+
+    Uses a learned rotation matrix per parameter to align gradients before
+    applying Sinkhorn normalization, achieving better spectral conditioning
+    than fixed orthogonalization methods.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        momentum=0.95,
+        weight_decay=0.0,
+        nesterov=True,
+        sinkhorn_iters=5,
+    ):
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            sinkhorn_iters=sinkhorn_iters,
+        )
+        super().__init__(params, defaults)
+
+    def reset(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].zero_()
+                if "rotation" in state:
+                    state["rotation"].copy_(
+                        torch.eye(p.size(-2), device=p.device, dtype=torch.float32)
+                    )
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            sinkhorn_iters = group["sinkhorn_iters"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                g = p.grad
+                state = self.state[p]
+
+                # Initialize state on first step
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                if "rotation" not in state:
+                    state["rotation"] = torch.eye(
+                        p.size(-2), device=p.device, dtype=torch.float32
+                    )
+
+                buf = state["momentum_buffer"]
+                R = state["rotation"]
+
+                # Momentum EMA
+                buf.lerp_(g, 1 - group["momentum"])
+                M = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+
+                M_float = M.float()
+
+                # --- Rotation selection (first Sinkhorn call) ---
+                D_tilde = sinkhorn_normalize(R.mT @ M_float, num_iters=sinkhorn_iters)
+                A = M_float @ D_tilde.mT  # m x m cross-Gram
+                R_new = shifted_cholesky_qr(A)
+                state["rotation"] = R_new
+
+                # --- Rotated update (second Sinkhorn call) ---
+                update = sinkhorn_normalize(R_new.mT @ M_float, num_iters=sinkhorn_iters)
+                delta = R_new @ update  # rotate back to original coords
+
+                # Apply shape multiplier, lr_mul, masked weight decay (same as NorMuon)
+                shape_mult = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+                eff_lr = lr * shape_mult * getattr(p, "lr_mul", 1.0)
+
+                wd_mul = getattr(p, "wd_mul", 1.0)
+                eff_wd = wd_mul * wd * lr
+                mask = (delta * p) >= 0
+                if eff_wd != 0:
+                    p.addcmul_(p, mask, value=-eff_wd * eff_lr)
+                p.add_(delta.to(dtype=p.dtype), alpha=-eff_lr)
