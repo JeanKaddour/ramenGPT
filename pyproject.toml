@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ramengpt"
+version = "0.1.0"
+description = "Train small GPT models on a single GPU."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "datasets",
+    "tiktoken",
+    "numpy",
+    "torch",
+    "huggingface-hub",
+    "kernels",
+    "setuptools",
+    "wandb",
+]
+
+[tool.setuptools]
+packages = []
+
+[tool.uv]
+dev-dependencies = []
