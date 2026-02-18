@@ -1,6 +1,7 @@
 # 🍜 ramenGPT
 
 **Train small GPT models on a single GPU**
+
 Modded [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) w/o distributed training.
 
 ![header](assets/header.jpg)
