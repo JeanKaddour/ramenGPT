@@ -34,7 +34,10 @@
 - If adding formatting/linting tooling, document it here before adoption (none is currently enforced).
 
 ## Testing Guidelines
-- There is no dedicated unit-test suite yet.
+- **After every newly introduced method or refactor**, run a 10-step smoke test to verify nothing breaks:
+  ```bash
+  uv run run.py --config config/base.py --early_stop_steps 10 --seed 123
+  ```
 - Validation is currently practical via smoke runs and deterministic reproducibility checks:
   - `--early_stop_steps` for bounded runs.
   - `--seed` to verify repeatability.

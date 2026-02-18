@@ -47,6 +47,14 @@ No test suite exists. Validate via smoke runs with `--early_stop_steps` and `--s
 
 **Data format:** Pre-tokenized FineWeb shards (`.bin` files with 256-int32 header + uint16 tokens). BOS-aligned batching assembles sequences starting at document boundaries.
 
+## Validation Workflow
+
+After every newly introduced method or refactor, run a 10-step smoke test to verify nothing breaks:
+
+```bash
+uv run run.py --config config/base.py --early_stop_steps 10 --seed 123
+```
+
 ## Coding Style
 
 - PEP 8 with 4-space indentation, `snake_case` for config keys
