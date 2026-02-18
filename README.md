@@ -1,13 +1,11 @@
 # 🍜 ramenGPT
 
-**Train small GPT models on a single GPU**
-
-Modded [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) w/o distributed training.
+**Train small GPT models on a single GPU**: Modded [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) w/o distributed training.
 
 ![header](assets/header.jpg)
 
 ## Quickstart
-On a single GPU machine, you can run
+On a single GPU machine (eg. 30/40/5090 or A/H100), you can run
 
 ```bash
 uv venv
