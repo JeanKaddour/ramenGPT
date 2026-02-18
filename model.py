@@ -36,64 +36,6 @@ def set_flex_attention_kernel_options(gpu_arch: str | None):
         _flex_attention_kernel_options = None
     return _flex_attention_kernel_options
 
-# -----------------------------------------------------------------------------
-# Polar Express orthogonalization (from train_gpt.py)
-# Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
-# by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
-
-# Computed for num_iters=5, safety_factor=2e-2, cushion=2
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
-]
-
-@torch.compile(dynamic=False, fullgraph=True)
-def polar_express(G: torch.Tensor):
-    """
-    Polar Express Sign Method for orthogonalization.
-    Replaces Newton-Schulz iteration with faster 5-iteration method.
-    """
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
-
-    # Perform the iterations
-    for a, b, c in polar_express_coeffs:
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
-
-# -----------------------------------------------------------------------------
-# NorMuon variance reduction (from train_gpt.py)
-# Adds a low-rank variance estimator similar to Adafactor
-
-@torch.compile(dynamic=False, fullgraph=True)
-def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red_dim):
-    """
-    NorMuon variance reduction with low-rank second-moment estimator.
-    Algebraically fuses the normalization steps to minimize memory ops.
-    """
-    v_mean = v_chunk.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = v_chunk.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
-    v_norm = v_norm_sq.sqrt_()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt_()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
-    return v_chunk.mul_(final_scale.type_as(v_chunk))
-
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
