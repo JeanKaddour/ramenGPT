@@ -1,0 +1,22 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "editor.formatOnSave": true,
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter"
+  },
+  "black-formatter.interpreter": "${command:python.interpreterPath}",
+  "black-formatter.importStrategy": "fromEnvironment",
+  "black-formatter.path": [],
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": "always",
+    "source.organizeImports.isort": "always"
+  },
+  "isort.interpreter": ["${command:python.interpreterPath}"],
+  "isort.path": [],
+  "isort.args": [
+    "--profile",
+    "black",
+    "--line-length",
+    "100"
+  ]
+}
