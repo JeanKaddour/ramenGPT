@@ -14,7 +14,6 @@ except ImportError:  # pragma: no cover
 # -----------------------------------------------------------------------------
 # FlexAttention kernel options for different GPU architectures
 # GPUs with limited shared memory need reduced num_stages/block sizes in backward pass.
-# The value is configured from train.py after GPU detection.
 # -----------------------------------------------------------------------------
 
 _flex_attention_kernel_options = None
@@ -38,6 +37,50 @@ def set_flex_attention_kernel_options(gpu_arch: str | None):
 
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
+
+
+def _normalize_activation_name(activation: str) -> str:
+    if not isinstance(activation, str):
+        raise TypeError(f"activation must be a string, got {type(activation)!r}")
+    normalized = activation.strip().lower()
+    if not normalized:
+        raise ValueError("activation cannot be empty")
+    return normalized
+
+
+def _get_activation_spec(activation: str):
+    activation = _normalize_activation_name(activation)
+    if activation == 'relu':
+        return False, F.relu
+    if activation == 'gelu':
+        return False, F.gelu
+    if activation == 'swish':
+        return False, F.silu
+    if activation == 'silu':
+        return False, F.silu
+    if activation == 'linear':
+        return False, lambda x: x
+    if activation == 'identity':
+        return False, lambda x: x
+    if activation == 'relu_squared':
+        return False, lambda x: F.relu(x).square()
+    if activation == 'gelu_squared':
+        return False, lambda x: F.gelu(x).square()
+    if activation == 'swish_squared':
+        return False, lambda x: F.silu(x).square()
+    if activation == 'silu_squared':
+        return False, lambda x: F.silu(x).square()
+    if activation == 'geglu':
+        return True, F.gelu
+    if activation == 'swiglu':
+        return True, F.silu
+
+    supported = [
+        'relu', 'gelu', 'swish', 'silu', 'linear', 'identity',
+        'relu_squared', 'gelu_squared', 'swish_squared', 'silu_squared',
+        'geglu', 'swiglu',
+    ]
+    raise ValueError(f"Unsupported activation: {activation}. Supported: {', '.join(supported)}")
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
@@ -212,18 +255,31 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     """
     MLP block matching train_gpt.py structure exactly.
-    Uses raw nn.Parameter with transposed layout and hardcoded ReLU² activation.
+    Uses raw nn.Parameter with transposed layout and configurable activation.
     """
-    def __init__(self, dim: int, c_proj_lr_mul: float, std_scale: float):
+    def __init__(self, dim: int, c_proj_lr_mul: float, std_scale: float,
+                 activation: str = 'relu_squared', ffn_dim: int | None = None):
         super().__init__()
-        hdim = 4 * dim
+
+        self.activation, self.activation_fn = _get_activation_spec(activation)
+        self.activation_name = _normalize_activation_name(activation)
+
+        if ffn_dim is None:
+            ffn_dim = 4 * dim
+        if self.activation:
+            ffn_dim = int(ffn_dim)
+            c_fc_dim = 2 * ffn_dim
+        else:
+            c_fc_dim = ffn_dim
+
         # Transposed layout to match attention weights (from train_gpt.py)
-        self.c_fc = nn.Parameter(torch.empty(hdim, dim))
-        self.c_proj = nn.Parameter(torch.empty(hdim, dim))
+        self.c_fc = nn.Parameter(torch.empty(c_fc_dim, dim))
+        self.c_proj = nn.Parameter(torch.empty(ffn_dim, dim))
         # Label all modules for explicit optimizer grouping
         self.c_fc.label = 'mlp'
         self.c_proj.label = 'mlp'
         self.c_proj.lr_mul = c_proj_lr_mul  # Match train_gpt.py
+        self.ffn_dim = ffn_dim
 
         std = std_scale * (dim ** -0.5)
         bound = (3 ** 0.5) * std  # improved init scale by @YouJiacheng
@@ -233,7 +289,11 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor):
         x = F.linear(x, self.c_fc.type_as(x))
-        x = F.relu(x).square()  # ReLU² - ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        if self.activation:
+            x_gate, x_sig = x.chunk(2, dim=-1)
+            x = self.activation_fn(x_gate) * x_sig
+        else:
+            x = self.activation_fn(x)
         x = F.linear(x, self.c_proj.T.type_as(x))
         return x
 
@@ -243,7 +303,8 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int,
                  head_dim: int, skip_attention: bool,
                  c_proj_lr_mul: float, mlp_std_scale: float, value_embed_gate_scale: float,
-                 gating_config: dict = None, value_embed_layers: list = None):
+                 gating_config: dict = None, value_embed_layers: list = None,
+                 activation: str = 'relu_squared', ffn_dim: int | None = None):
         super().__init__()
         self.dim = dim
         self.layer_idx = layer_idx
@@ -260,8 +321,14 @@ class Block(nn.Module):
         else:
             self.attn = None
 
-        # MLP with hardcoded ReLU² (matching train_gpt.py)
-        self.mlp = MLP(dim, c_proj_lr_mul=c_proj_lr_mul, std_scale=mlp_std_scale)
+        # FFN activation and width are configurable per model_config.
+        self.mlp = MLP(
+            dim,
+            c_proj_lr_mul=c_proj_lr_mul,
+            std_scale=mlp_std_scale,
+            activation=activation,
+            ffn_dim=ffn_dim,
+        )
         # Labels already set inside MLP.__init__()
 
     def forward(self, x: Tensor, ve: Tensor, sa_lambdas: Tensor, block_mask,
@@ -313,8 +380,19 @@ class GPT(nn.Module):
         model_dim = model_config['model_dim']
         head_dim = model_config['head_dim']
         block_size = attention_config['block_size']
+        self.activation = model_config.get('activation', 'relu_squared')
+        self.ffn_dim = model_config.get('ffn_dim', None)
 
-        # Note: activation is hardcoded to ReLU² in MLP to match train_gpt.py
+        # Validate and normalize activation configuration.
+        is_glu, _ = _get_activation_spec(self.activation)
+        if self.ffn_dim is not None:
+            self.ffn_dim = int(self.ffn_dim)
+        else:
+            self.ffn_dim = 4 * model_dim
+            if is_glu:
+                # GLU-family FFNs use split hidden projection; use a smaller width
+                # so parameter counts stay near legacy 2:1 linear projection ratio.
+                self.ffn_dim = max(1, (8 * model_dim) // 3)
 
         # Vocab size rounded up for efficiency
         vocab_size_padded = next_multiple_of_n(vocab_size, n=embed_padding_multiple)
@@ -368,6 +446,8 @@ class GPT(nn.Module):
                 c_proj_lr_mul=c_proj_lr_mul,
                 mlp_std_scale=mlp_init_std_scale,
                 value_embed_gate_scale=value_embed_gate_scale,
+                activation=self.activation,
+                ffn_dim=self.ffn_dim,
             )
             for i in range(num_layers)
         ])

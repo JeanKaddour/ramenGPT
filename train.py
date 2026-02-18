@@ -491,6 +491,12 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         model_config['activation'] = args.activation
         print(f"Override: activation = {args.activation}")
 
+    if args.ffn_dim is not None:
+        if args.ffn_dim < 1:
+            raise ValueError("--ffn_dim must be >= 1")
+        model_config['ffn_dim'] = args.ffn_dim
+        print(f"Override: ffn_dim = {args.ffn_dim}")
+
     if args.checkpoint_every is not None:
         if args.checkpoint_every < 0:
             raise ValueError("--checkpoint_every must be >= 0")

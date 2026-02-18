@@ -23,6 +23,8 @@ def _parse_args():
                                  'relu_squared', 'gelu_squared', 'swish_squared', 'silu_squared',
                                  'geglu', 'swiglu'],
                         help='Activation function to use (overrides config)')
+    parser.add_argument('--ffn_dim', type=int, default=None,
+                        help='FFN hidden width (overrides config; default auto from activation)')
     parser.add_argument('--checkpoint_every', type=int, default=None,
                         help='Save checkpoints every K steps (overrides training_config.checkpoint_every; 0 disables periodic saves)')
     return parser.parse_args()
