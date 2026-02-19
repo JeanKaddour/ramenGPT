@@ -355,7 +355,7 @@ class TrainingManager:
         embed = self.model.embed.weight
         # If resuming from a checkpoint after split, this param group may already exist.
         for group in self.adam_opt.param_groups:
-            if embed in group["params"]:
+            if any(p is embed for p in group["params"]):
                 return
 
         # Add embed to optimizer with same config as lm_head
