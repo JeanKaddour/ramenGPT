@@ -37,7 +37,8 @@ rope_config = dict(
 
 embed_config = dict(
     weight_tied=True,
-    split_frac=2.0,
+    enable_embed_split=True,  # create untied embedding late in training if enabled
+    split_frac=0.90,  # fraction of the full run reached when untying embeddings
 )
 
 skip_config = dict(

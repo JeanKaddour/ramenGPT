@@ -162,14 +162,19 @@ class TrainingManager:
             "num_scheduled_iterations", self.num_iterations
         )
 
-        split_frac = self.embed_config.get("split_frac", 2 / 3)
-        self.split_step = math.ceil(split_frac * self.num_scheduled_iterations)
+        split_frac = self.embed_config.get("split_frac", 0.90)
+        self.embed_tied = self.embed_config.get("weight_tied", True)
+        self.embed_split_enabled = bool(
+            self.embed_config.get("enable_embed_split", True)
+            and self.embed_tied
+        )
+        self.split_step = math.ceil(split_frac * self.num_iterations) if self.embed_split_enabled else -1
 
         # Current state
         self.current_batch_size_idx = 0
         self.current_window_size_idx = 0
         self.current_window_size = self.window_schedule_config.get("schedule", [3])[0]
-        self.embed_split_done = False
+        self.embed_split_done = not self.embed_tied
         self.scalar_freeze_countdown = 0
 
         # Optimizers (set later)
@@ -283,7 +288,7 @@ class TrainingManager:
             self.scalar_freeze_countdown = self.freeze_steps
 
         # Check for embed/lm_head split
-        if not self.embed_split_done and step == self.split_step:
+        if self.embed_split_enabled and not self.embed_split_done and step == self.split_step:
             if hasattr(self.model, "create_embed"):
                 self.print_fn(
                     f"Step {step}: Splitting embed from lm_head (split_step={self.split_step})"
@@ -754,11 +759,8 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     # learning rate scheduler: supports multiple scheduler types
     def get_lr(step: int):
         num_iterations = training_config["num_iterations"]
-        num_scheduled_iterations = training_config.get("num_scheduled_iterations", num_iterations)
-
-        # Extension phase
-        if step > num_scheduled_iterations:
-            return 0.1
+        if step > num_iterations:
+            return training_config.get("final_lr_ratio", 0.1)
 
         # Use lr_scheduler_config if available, otherwise fall back to legacy config
         if lr_scheduler_config is not None:
@@ -872,7 +874,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             # Legacy behavior: use warmup_config
             # Match train_gpt.py intent: increase LR when batch size increases
             lr_max = 1.0
-            x = step / num_scheduled_iterations  # progress in training
+            x = step / num_iterations  # progress in training
 
             # Batch size schedule scaling (config-driven, not hardcoded thirds).
             if batch_schedule_config is not None:
@@ -910,7 +912,8 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             # Cooldown phase
             else:
                 w = (1 - x) / training_config["cooldown_frac"]
-                return lr_max * w + (1 - w) * 0.1
+                final_lr_ratio = training_config.get("final_lr_ratio", 0.1)
+                return lr_max * w + (1 - w) * final_lr_ratio
 
     # attention window size schedule (only for GPT)
     if model_type == "gpt":
@@ -1036,6 +1039,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             model: nn.Module = torch.compile(
                 model, backend="inductor", dynamic=False, mode=compile_mode
             )
+            training_manager.model = model
             print_log("Model compilation complete")
         except Exception as e:
             error_str = str(e)

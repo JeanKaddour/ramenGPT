@@ -504,6 +504,8 @@ class GPT(nn.Module):
         self.ffn_dim = model_config.get("ffn_dim", None)
         mlp_type = model_config.get("mlp_type", "default")
         mlp_kwargs = model_config.get("mlp_kwargs", {})
+        self._weight_tied_embeddings = self.embed_config.get("weight_tied", True)
+        self._enable_embed_split = self.embed_config.get("enable_embed_split", True)
 
         # Validate and normalize activation configuration.
         is_glu, _ = _get_activation_spec(self.activation)
@@ -584,10 +586,21 @@ class GPT(nn.Module):
         nn.init.normal_(self.lm_head.weight, mean=0, std=lm_head_init_std)
         self.lm_head.weight.label = "lm_head"
 
-        # Weight-tied embedding: use lm_head.weight for embed initially
-        # Separate embed created when split_embed is set to True
-        self.embed = None  # Will use lm_head.weight
-        self.split_embed = False
+        # Weight tying / untied embedding behavior.
+        if self._weight_tied_embeddings:
+            # Start with tied embedding. `create_embed()` can split later.
+            self.embed = None  # Will use lm_head.weight
+            self.split_embed = False
+        else:
+            # Start untied from step 0.
+            self.embed = nn.Embedding(self.vocab_size_padded, self.model_dim)
+            self.embed = self.embed.to(
+                device=self.lm_head.weight.device, dtype=self.lm_head.weight.dtype
+            )
+            self.embed.weight.data.copy_(self.lm_head.weight.data)
+            self.embed.weight.label = "embed"
+            self.embed.weight.wd_mul = wd_multipliers["embed"]
+            self.split_embed = True
 
         # x0_lambdas separated for different optimizer treatment
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
@@ -646,7 +659,7 @@ class GPT(nn.Module):
 
     def create_embed(self):
         """Create separate embedding when weight tying is split"""
-        if self.embed is None:
+        if self.embed is None and self._weight_tied_embeddings and self._enable_embed_split:
             self.embed = nn.Embedding(self.vocab_size_padded, self.model_dim)
             # Move to correct device and dtype to match lm_head
             self.embed = self.embed.to(

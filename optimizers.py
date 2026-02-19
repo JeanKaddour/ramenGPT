@@ -19,7 +19,6 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
     scalar_opt = None
     matrix_opt = None
     matrix_optimizer_type = None
-
     if use_muon and len(hidden_matrix_params) > 0:
         # Use Muon/ARO/BAM for hidden matrix parameters if available.
         adam_param_groups = []
@@ -44,7 +43,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                     "betas": scalar_adam_cfg.get("betas", (0.9, 0.99)),
                     "eps": scalar_adam_cfg.get("eps", 1e-8),
                     "weight_decay": scalar_adam_cfg.get("weight_decay", 0.0),
-                }
+                },
             ]
             scalar_opt = Adam(scalar_param_groups)
             print_fn(f"Created separate scalar optimizer for {len(all_scalar_params)} parameters")
@@ -220,8 +219,20 @@ class Adam(torch.optim.Optimizer):
     Uses lr_mul but NOT shape_mult for learning rate (DistAdam doesn't use shape scaling).
     """
 
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+    ):
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+        )
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -260,7 +271,7 @@ class Adam(torch.optim.Optimizer):
                 eff_weight_decay = lr * wd * wd_mul
                 if eff_weight_decay != 0:
                     mask = (update * p) > 0
-                    update.addcmul_(p, mask, value=eff_weight_decay * lr)
+                    update.addcmul_(p, mask, value=eff_weight_decay)
 
                 p.add_(update, alpha=-1.0)
 
@@ -271,9 +282,21 @@ class NorMuon(torch.optim.Optimizer):
     https://arxiv.org/abs/2510.05491
     """
 
-    def __init__(self, params, lr=0.02, momentum=0.95, beta2=0.95, weight_decay=0.0, nesterov=True):
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        momentum=0.95,
+        beta2=0.95,
+        weight_decay=0.0,
+        nesterov=True,
+    ):
         defaults = dict(
-            lr=lr, momentum=momentum, beta2=beta2, weight_decay=weight_decay, nesterov=nesterov
+            lr=lr,
+            momentum=momentum,
+            beta2=beta2,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
         )
         super().__init__(params, defaults)
 
@@ -329,7 +352,7 @@ class NorMuon(torch.optim.Optimizer):
                 eff_lr = lr * shape_mult * getattr(p, "lr_mul", 1.0)
 
                 wd_mul = getattr(p, "wd_mul", 1.0)
-                eff_wd = wd_mul * wd * lr
+                eff_wd = wd_mul * wd
                 mask = (g * p) >= 0
                 if eff_wd != 0:
                     p.addcmul_(p, mask, value=-eff_wd * eff_lr)
@@ -361,9 +384,21 @@ class BAM(torch.optim.Optimizer):
     O(mn) per step vs O(mn*min(m,n)) for Newton-Schulz.
     """
 
-    def __init__(self, params, lr=0.02, momentum=0.95, weight_decay=0.0, nesterov=True, sink_steps=1):
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        momentum=0.95,
+        weight_decay=0.0,
+        nesterov=True,
+        sink_steps=1,
+    ):
         defaults = dict(
-            lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov, sink_steps=sink_steps
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            sink_steps=sink_steps,
         )
         super().__init__(params, defaults)
 
@@ -399,7 +434,7 @@ class BAM(torch.optim.Optimizer):
                 eff_lr = lr * shape_mult * getattr(p, "lr_mul", 1.0)
 
                 wd_mul = getattr(p, "wd_mul", 1.0)
-                eff_wd = wd_mul * wd * lr
+                eff_wd = wd_mul * wd
                 mask = (g * p) >= 0
                 if eff_wd != 0:
                     p.addcmul_(p, mask, value=-eff_wd * eff_lr)
@@ -518,7 +553,7 @@ class AROSinkhorn(torch.optim.Optimizer):
                 eff_lr = lr * shape_mult * getattr(p, "lr_mul", 1.0)
 
                 wd_mul = getattr(p, "wd_mul", 1.0)
-                eff_wd = wd_mul * wd * lr
+                eff_wd = wd_mul * wd
                 mask = (delta * p) >= 0
                 if eff_wd != 0:
                     p.addcmul_(p, mask, value=-eff_wd * eff_lr)
