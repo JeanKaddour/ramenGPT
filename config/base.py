@@ -97,6 +97,7 @@ training_config = dict(
 optimizer_config = dict(
     use_muon=True,
     matrix_optimizer="muon",  # "muon", "aro", or "bam"
+    apply_lr_scale_to_weight_decay=False,
     adam=dict(
         lr=0.006,
         betas=(0.65, 0.95),

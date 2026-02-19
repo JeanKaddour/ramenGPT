@@ -19,6 +19,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
     scalar_opt = None
     matrix_opt = None
     matrix_optimizer_type = None
+    scale_weight_decay_by_lr = optimizer_config.get("apply_lr_scale_to_weight_decay", False)
     if use_muon and len(hidden_matrix_params) > 0:
         # Use Muon/ARO/BAM for hidden matrix parameters if available.
         adam_param_groups = []
@@ -32,7 +33,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                     "weight_decay": adam_cfg["weight_decay"],
                 }
             )
-        adam_opt = Adam(adam_param_groups)
+        adam_opt = Adam(adam_param_groups, scale_weight_decay_by_lr=scale_weight_decay_by_lr)
 
         all_scalar_params = scalar_params + x0_lambda_params
         if all_scalar_params:
@@ -45,7 +46,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                     "weight_decay": scalar_adam_cfg.get("weight_decay", 0.0),
                 },
             ]
-            scalar_opt = Adam(scalar_param_groups)
+            scalar_opt = Adam(scalar_param_groups, scale_weight_decay_by_lr=scale_weight_decay_by_lr)
             print_fn(f"Created separate scalar optimizer for {len(all_scalar_params)} parameters")
 
         matrix_optimizer_type = optimizer_config.get("matrix_optimizer", "muon")
@@ -69,6 +70,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                 weight_decay=aro_cfg.get("weight_decay", 0.0),
                 nesterov=aro_cfg.get("nesterov", True),
                 sinkhorn_iters=aro_cfg.get("sinkhorn_iters", 5),
+                scale_weight_decay_by_lr=scale_weight_decay_by_lr,
             )
             print_fn(
                 f"Using ARO-Sinkhorn optimizer for {len(hidden_matrix_params)} matrix parameters"
@@ -93,6 +95,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                 weight_decay=bam_cfg.get("weight_decay", 0.0),
                 nesterov=bam_cfg.get("nesterov", True),
                 sink_steps=bam_cfg.get("sink_steps", 1),
+                scale_weight_decay_by_lr=scale_weight_decay_by_lr,
             )
             print_fn(f"Using BAM optimizer for {len(hidden_matrix_params)} matrix parameters")
         else:
@@ -115,6 +118,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                 beta2=muon_cfg.get("beta2", 0.95),
                 weight_decay=muon_cfg.get("weight_decay", 0.0),
                 nesterov=muon_cfg.get("nesterov", True),
+                scale_weight_decay_by_lr=scale_weight_decay_by_lr,
             )
             print_fn(f"Using NorMuon optimizer for {len(hidden_matrix_params)} matrix parameters")
 
@@ -136,7 +140,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                     "weight_decay": adam_cfg["weight_decay"],
                 }
             )
-        adam_opt = Adam(adam_param_groups)
+        adam_opt = Adam(adam_param_groups, scale_weight_decay_by_lr=scale_weight_decay_by_lr)
         optimizers = [adam_opt]
 
         all_scalar_params = scalar_params + x0_lambda_params
@@ -150,7 +154,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                     "weight_decay": 0.0,
                 }
             ]
-            scalar_opt = Adam(scalar_param_groups)
+            scalar_opt = Adam(scalar_param_groups, scale_weight_decay_by_lr=scale_weight_decay_by_lr)
             optimizers.append(scalar_opt)
 
         print_fn("Using Adam optimizer for all parameters")
@@ -226,12 +230,14 @@ class Adam(torch.optim.Optimizer):
         betas=(0.9, 0.999),
         eps=1e-8,
         weight_decay=0.0,
+        scale_weight_decay_by_lr=False,
     ):
         defaults = dict(
             lr=lr,
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
+            scale_weight_decay_by_lr=scale_weight_decay_by_lr,
         )
         super().__init__(params, defaults)
 
@@ -241,6 +247,7 @@ class Adam(torch.optim.Optimizer):
             beta1, beta2 = group["betas"]
             eps = group["eps"]
             wd = group["weight_decay"]
+            scale_weight_decay_by_lr = group["scale_weight_decay_by_lr"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -269,6 +276,8 @@ class Adam(torch.optim.Optimizer):
 
                 wd_mul = getattr(p, "wd_mul", 1.0)
                 eff_weight_decay = lr * wd * wd_mul
+                if scale_weight_decay_by_lr:
+                    eff_weight_decay *= lr
                 if eff_weight_decay != 0:
                     mask = (update * p) > 0
                     update.addcmul_(p, mask, value=eff_weight_decay)
@@ -290,6 +299,7 @@ class NorMuon(torch.optim.Optimizer):
         beta2=0.95,
         weight_decay=0.0,
         nesterov=True,
+        scale_weight_decay_by_lr=False,
     ):
         defaults = dict(
             lr=lr,
@@ -297,6 +307,7 @@ class NorMuon(torch.optim.Optimizer):
             beta2=beta2,
             weight_decay=weight_decay,
             nesterov=nesterov,
+            scale_weight_decay_by_lr=scale_weight_decay_by_lr,
         )
         super().__init__(params, defaults)
 
@@ -315,6 +326,7 @@ class NorMuon(torch.optim.Optimizer):
             lr = group["lr"]
             wd = group["weight_decay"]
             beta2 = group["beta2"]
+            scale_weight_decay_by_lr = group["scale_weight_decay_by_lr"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -353,6 +365,8 @@ class NorMuon(torch.optim.Optimizer):
 
                 wd_mul = getattr(p, "wd_mul", 1.0)
                 eff_wd = wd_mul * wd
+                if scale_weight_decay_by_lr:
+                    eff_wd *= lr
                 mask = (g * p) >= 0
                 if eff_wd != 0:
                     p.addcmul_(p, mask, value=-eff_wd * eff_lr)
@@ -392,6 +406,7 @@ class BAM(torch.optim.Optimizer):
         weight_decay=0.0,
         nesterov=True,
         sink_steps=1,
+        scale_weight_decay_by_lr=False,
     ):
         defaults = dict(
             lr=lr,
@@ -399,6 +414,7 @@ class BAM(torch.optim.Optimizer):
             weight_decay=weight_decay,
             nesterov=nesterov,
             sink_steps=sink_steps,
+            scale_weight_decay_by_lr=scale_weight_decay_by_lr,
         )
         super().__init__(params, defaults)
 
@@ -414,6 +430,7 @@ class BAM(torch.optim.Optimizer):
         for group in self.param_groups:
             lr = group["lr"]
             wd = group["weight_decay"]
+            scale_weight_decay_by_lr = group["scale_weight_decay_by_lr"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -435,6 +452,8 @@ class BAM(torch.optim.Optimizer):
 
                 wd_mul = getattr(p, "wd_mul", 1.0)
                 eff_wd = wd_mul * wd
+                if scale_weight_decay_by_lr:
+                    eff_wd *= lr
                 mask = (g * p) >= 0
                 if eff_wd != 0:
                     p.addcmul_(p, mask, value=-eff_wd * eff_lr)
@@ -486,6 +505,7 @@ class AROSinkhorn(torch.optim.Optimizer):
         weight_decay=0.0,
         nesterov=True,
         sinkhorn_iters=5,
+        scale_weight_decay_by_lr=False,
     ):
         defaults = dict(
             lr=lr,
@@ -493,6 +513,7 @@ class AROSinkhorn(torch.optim.Optimizer):
             weight_decay=weight_decay,
             nesterov=nesterov,
             sinkhorn_iters=sinkhorn_iters,
+            scale_weight_decay_by_lr=scale_weight_decay_by_lr,
         )
         super().__init__(params, defaults)
 
@@ -513,6 +534,7 @@ class AROSinkhorn(torch.optim.Optimizer):
             lr = group["lr"]
             wd = group["weight_decay"]
             sinkhorn_iters = group["sinkhorn_iters"]
+            scale_weight_decay_by_lr = group["scale_weight_decay_by_lr"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -554,6 +576,8 @@ class AROSinkhorn(torch.optim.Optimizer):
 
                 wd_mul = getattr(p, "wd_mul", 1.0)
                 eff_wd = wd_mul * wd
+                if scale_weight_decay_by_lr:
+                    eff_wd *= lr
                 mask = (delta * p) >= 0
                 if eff_wd != 0:
                     p.addcmul_(p, mask, value=-eff_wd * eff_lr)
