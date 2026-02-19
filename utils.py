@@ -7,6 +7,10 @@ import os
 import subprocess
 
 
+def _is_relaxed_compile_enabled() -> bool:
+    return os.environ.get("RAMENGPT_RELAXED_COMPILE", "").lower() in {"1", "true", "on", "yes"}
+
+
 def detect_gpu_architecture():
     """Detect GPU architecture before importing torch."""
     gpu_info = {
@@ -55,6 +59,7 @@ def detect_gpu_architecture():
 def setup_gpu_environment():
     """Set environment before torch/triton import."""
     gpu_info = detect_gpu_architecture()
+    relaxed_compile = _is_relaxed_compile_enabled()
     print(
         f"Detected GPU: {gpu_info['name']} (compute capability: {gpu_info['compute_capability']}, "
         f"architecture: {gpu_info['architecture']})"
@@ -62,37 +67,52 @@ def setup_gpu_environment():
 
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["TRITON_CACHE_DIR"] = "/tmp/triton_cache"
-    os.environ["TORCH_INDUCTOR_FORCE_DISABLE_CACHES"] = "1"
     os.environ["FLA_CONV_BACKEND"] = "triton"
-    os.environ["TRITON_AUTOTUNE"] = "0"
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/inductor_cache"
     os.environ["PYTORCH_DISABLE_CUDA_GRAPHS"] = "1"
-    os.environ["TRITON_DEFAULT_NUM_STAGES"] = "1"
-    os.environ["TRITON_DEFAULT_NUM_WARPS"] = "4"
 
     if gpu_info["architecture"] == "ampere":
         os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"
         os.environ["TRITON_MAX_SHARED_MEMORY"] = "100000"
-        os.environ["TRITON_NUM_STAGES"] = "1"
-        os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE"] = "EXHAUSTIVE"
-        os.environ["TORCH_INDUCTOR_DEFAULT_NUM_STAGES"] = "1"
-        os.environ["INDUCTOR_TRITON_NUM_STAGES"] = "1"
-        print("  -> Configured for Ampere architecture (RTX 30 series)")
+        if relaxed_compile:
+            os.environ["TRITON_NUM_STAGES"] = "2"
+            os.environ["TRITON_AUTOTUNE"] = "1"
+            print("  -> Configured for Ampere architecture with relaxed compile settings")
+        else:
+            os.environ["TRITON_AUTOTUNE"] = "0"
+            os.environ["TRITON_NUM_STAGES"] = "1"
+            os.environ["TORCH_INDUCTOR_FORCE_DISABLE_CACHES"] = "1"
+            os.environ["TRITON_DEFAULT_NUM_STAGES"] = "1"
+            os.environ["TRITON_DEFAULT_NUM_WARPS"] = "4"
+            os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE"] = "EXHAUSTIVE"
+            os.environ["TORCH_INDUCTOR_DEFAULT_NUM_STAGES"] = "1"
+            os.environ["INDUCTOR_TRITON_NUM_STAGES"] = "1"
+            print("  -> Configured for Ampere architecture (RTX 30 series)")
 
     elif gpu_info["architecture"] == "ada":
         os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
         os.environ["TRITON_MAX_SHARED_MEMORY"] = "164000"
-        print("  -> Configured for Ada Lovelace architecture (RTX 40 series)")
+        if relaxed_compile:
+            print("  -> Configured for Ada architecture with relaxed compile settings")
+        else:
+            print("  -> Configured for Ada Lovelace architecture (RTX 40 series)")
 
     elif gpu_info["architecture"] == "blackwell":
         if gpu_info["compute_capability"]:
             os.environ["TORCH_CUDA_ARCH_LIST"] = gpu_info["compute_capability"]
         os.environ["TRITON_MAX_SHARED_MEMORY"] = "228000"
-        os.environ["TRITON_NUM_STAGES"] = "1"
-        os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE"] = "EXHAUSTIVE"
-        os.environ["TORCH_INDUCTOR_DEFAULT_NUM_STAGES"] = "1"
-        os.environ["INDUCTOR_TRITON_NUM_STAGES"] = "1"
-        print("  -> Configured for Blackwell architecture (RTX 50 series)")
+        if relaxed_compile:
+            print("  -> Configured for Blackwell architecture with relaxed compile settings")
+        else:
+            os.environ["TRITON_AUTOTUNE"] = "0"
+            os.environ["TRITON_NUM_STAGES"] = "1"
+            os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE"] = "EXHAUSTIVE"
+            os.environ["TORCH_INDUCTOR_DEFAULT_NUM_STAGES"] = "1"
+            os.environ["INDUCTOR_TRITON_NUM_STAGES"] = "1"
+            os.environ["TORCH_INDUCTOR_FORCE_DISABLE_CACHES"] = "1"
+            os.environ["TRITON_DEFAULT_NUM_STAGES"] = "1"
+            os.environ["TRITON_DEFAULT_NUM_WARPS"] = "4"
+            print("  -> Configured for Blackwell architecture (RTX 50 series)")
 
     elif gpu_info["architecture"] == "hopper":
         os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
@@ -110,6 +130,8 @@ def configure_torch_runtime(gpu_info: dict):
     import torch._dynamo
     import torch._inductor.config as inductor_config
 
+    relaxed_compile = _is_relaxed_compile_enabled()
+
     inductor_config.max_autotune = False
     inductor_config.autotune_local_cache = False
     inductor_config.autotune_remote_cache = False
@@ -118,17 +140,33 @@ def configure_torch_runtime(gpu_info: dict):
     inductor_config.triton.cudagraphs = False
 
     if gpu_info.get("architecture") in ("blackwell", "ampere"):
-        inductor_config.fallback_random = True
-        inductor_config.force_disable_caches = True
-        inductor_config.compile_threads = 1
-        if hasattr(inductor_config, "worker_start_method"):
-            inductor_config.worker_start_method = "fork"
-        if hasattr(inductor_config, "triton"):
-            if hasattr(inductor_config.triton, "num_stages"):
-                inductor_config.triton.num_stages = 1
-            if hasattr(inductor_config.triton, "num_warps"):
-                inductor_config.triton.num_warps = 4
-        print(f"  -> Applied conservative inductor settings for {gpu_info.get('architecture')}")
+        if relaxed_compile:
+            inductor_config.max_autotune = True
+            inductor_config.autotune_local_cache = True
+            inductor_config.autotune_remote_cache = True
+            inductor_config.fallback_random = False
+            inductor_config.force_disable_caches = False
+            inductor_config.compile_threads = os.cpu_count() or 4
+            if hasattr(inductor_config, "triton"):
+                if hasattr(inductor_config.triton, "num_stages"):
+                    inductor_config.triton.num_stages = 2
+                if hasattr(inductor_config.triton, "num_warps"):
+                    inductor_config.triton.num_warps = 8
+            print(
+                f"  -> Applied relaxed inductor settings for {gpu_info.get('architecture')}"
+            )
+        else:
+            inductor_config.fallback_random = True
+            inductor_config.force_disable_caches = True
+            inductor_config.compile_threads = 1
+            if hasattr(inductor_config, "worker_start_method"):
+                inductor_config.worker_start_method = "fork"
+            if hasattr(inductor_config, "triton"):
+                if hasattr(inductor_config.triton, "num_stages"):
+                    inductor_config.triton.num_stages = 1
+                if hasattr(inductor_config.triton, "num_warps"):
+                    inductor_config.triton.num_warps = 4
+            print(f"  -> Applied conservative inductor settings for {gpu_info.get('architecture')}")
 
     torch._dynamo.config.suppress_errors = True
     torch._dynamo.config.cache_size_limit = 256

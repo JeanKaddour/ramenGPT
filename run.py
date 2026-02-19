@@ -52,6 +52,9 @@ def _parse_args():
             "silu_squared",
             "geglu",
             "swiglu",
+            "bsilu",
+            "nelu",
+            "relu_nelu",
         ],
         help="Activation function to use (overrides config)",
     )
@@ -60,6 +63,13 @@ def _parse_args():
         type=int,
         default=None,
         help="FFN hidden width (overrides config; default auto from activation)",
+    )
+    parser.add_argument(
+        "--mlp_type",
+        type=str,
+        default=None,
+        choices=["default", "ff", "nff", "residual_normed"],
+        help="MLP variant to use (overrides config)",
     )
     parser.add_argument(
         "--checkpoint_every",
@@ -113,8 +123,28 @@ def _apply_seed(seed: int):
     print(f"Random seed set to {seed}")
 
 
+def _apply_relaxed_compile_from_config(config):
+    """Apply relaxed compile default from config unless user already set env var."""
+    if os.environ.get("RAMENGPT_RELAXED_COMPILE"):
+        return
+
+    relaxed_compile = False
+    compilation_config = getattr(config, "compilation_config", {})
+    if isinstance(compilation_config, dict):
+        relaxed_compile = bool(compilation_config.get("relaxed_compile", False))
+
+    if relaxed_compile:
+        os.environ["RAMENGPT_RELAXED_COMPILE"] = "1"
+        print("  -> Relaxed compile enabled by config: compilation_config.relaxed_compile=True")
+
+
 def main():
     args = _parse_args()
+
+    if args.config is None:
+        raise SystemExit("No config path provided")
+    config = load_config(args.config)
+    _apply_relaxed_compile_from_config(config)
 
     detected_gpu_info = setup_gpu_environment()
     # Patch Triton shared memory reporting before any compilation paths are used.
@@ -135,9 +165,6 @@ def main():
     assert torch.cuda.is_available()
     torch.cuda.set_device(torch.device("cuda:0"))
 
-    if args.config is None:
-        raise SystemExit("No config path provided")
-    config = load_config(args.config)
     _ensure_fineweb10b_cached_data(config)
 
     from train import run_training

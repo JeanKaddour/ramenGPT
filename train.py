@@ -276,9 +276,9 @@ class TrainingManager:
 
         if new_ws != old_ws:
             self.print_fn(f"Step {step}: Window size transition {old_ws} -> {new_ws}")
-            # Call YaRN update if model has yarn
-            if hasattr(self.model, "yarn") and self.model.yarn is not None:
-                self.model.yarn.apply(old_ws, new_ws)
+            # Call positional embedding update on window size change
+            if hasattr(self.model, "pos_emb") and self.model.pos_emb is not None:
+                self.model.pos_emb.apply(old_ws, new_ws)
             self.current_window_size = new_ws
             self.scalar_freeze_countdown = self.freeze_steps
 
@@ -540,6 +540,10 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             raise ValueError("--ffn_dim must be >= 1")
         model_config["ffn_dim"] = args.ffn_dim
         print(f"Override: ffn_dim = {args.ffn_dim}")
+
+    if getattr(args, "mlp_type", None) is not None:
+        model_config["mlp_type"] = args.mlp_type
+        print(f"Override: mlp_type = {args.mlp_type}")
 
     if args.checkpoint_every is not None:
         if args.checkpoint_every < 0:
@@ -991,6 +995,13 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
     # Compile model after warmup based on configuration
     compile_model = compilation_config.get("compile_model", False)
+    relaxed_compile = os.environ.get("RAMENGPT_RELAXED_COMPILE", "").lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+    compile_mode = compilation_config.get("compile_mode", "default")
 
     if not compile_model:
         print_log("Model compilation disabled by configuration")
@@ -1011,13 +1022,15 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
             # For GPUs with shared memory constraints, use default mode
             # max-autotune is too slow for first run; default mode works well after our fixes
-            if detected_gpu_info.get("architecture") in ("ampere", "blackwell"):
+            if detected_gpu_info.get("architecture") in ("ampere", "blackwell") and not relaxed_compile:
                 compile_mode = "default"
                 print_log(
                     f"  -> Using compile mode '{compile_mode}' for {detected_gpu_info.get('architecture')} architecture"
                 )
             else:
-                compile_mode = "default"
+                compile_mode = compile_mode
+                if not relaxed_compile:
+                    print_log(f"  -> Using compile mode '{compile_mode}' for non-conservative path")
 
             # Try compilation with appropriate settings
             model: nn.Module = torch.compile(

@@ -4,12 +4,24 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from mlps import create_mlp as _create_mlp, _get_activation_spec
+
 # FlexAttention compatibility import. Not all environments expose this module.
 try:
     from torch.nn.attention.flex_attention import BlockMask, flex_attention
 except ImportError:  # pragma: no cover
     BlockMask = None
     flex_attention = None
+    _compiled_flex_attention = None
+else:
+    try:
+        _compiled_flex_attention = torch.compile(flex_attention)
+    except Exception:  # pragma: no cover
+        _compiled_flex_attention = None
+
+
+def _get_flex_attention():
+    return _compiled_flex_attention or flex_attention
 
 # -----------------------------------------------------------------------------
 # FlexAttention kernel options for different GPU architectures
@@ -41,59 +53,6 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def _normalize_activation_name(activation: str) -> str:
-    if not isinstance(activation, str):
-        raise TypeError(f"activation must be a string, got {type(activation)!r}")
-    normalized = activation.strip().lower()
-    if not normalized:
-        raise ValueError("activation cannot be empty")
-    return normalized
-
-
-def _get_activation_spec(activation: str):
-    activation = _normalize_activation_name(activation)
-    if activation == "relu":
-        return False, F.relu
-    if activation == "gelu":
-        return False, F.gelu
-    if activation == "swish":
-        return False, F.silu
-    if activation == "silu":
-        return False, F.silu
-    if activation == "linear":
-        return False, lambda x: x
-    if activation == "identity":
-        return False, lambda x: x
-    if activation == "relu_squared":
-        return False, lambda x: F.relu(x).square()
-    if activation == "gelu_squared":
-        return False, lambda x: F.gelu(x).square()
-    if activation == "swish_squared":
-        return False, lambda x: F.silu(x).square()
-    if activation == "silu_squared":
-        return False, lambda x: F.silu(x).square()
-    if activation == "geglu":
-        return True, F.gelu
-    if activation == "swiglu":
-        return True, F.silu
-
-    supported = [
-        "relu",
-        "gelu",
-        "swish",
-        "silu",
-        "linear",
-        "identity",
-        "relu_squared",
-        "gelu_squared",
-        "swish_squared",
-        "silu_squared",
-        "geglu",
-        "swiglu",
-    ]
-    raise ValueError(f"Unsupported activation: {activation}. Supported: {', '.join(supported)}")
-
-
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
@@ -109,6 +68,17 @@ def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat((y1, y2), 3)
+
+
+class PositionalEmbedding(nn.Module):
+    """Base class for positional embedding modules.
+    Subclasses must provide cos/sin buffers and attn_scale."""
+
+    def reset(self):
+        raise NotImplementedError
+
+    def apply(self, old_window: int, new_window: int):
+        raise NotImplementedError
 
 
 class CastedLinear(nn.Linear):
@@ -132,18 +102,26 @@ class CastedLinear(nn.Linear):
 
 
 # YaRN implementation for dynamic RoPE adaptation (from train_gpt.py @classiclarryd)
-class Yarn(nn.Module):
+class YarnPositionalEmbedding(PositionalEmbedding):
     """
     YaRN (Yet another RoPE extensioN) for dynamic window size adaptation.
     Allows extending context length during training by adjusting RoPE frequencies.
     """
 
-    def __init__(self, head_dim: int, max_seq_len: int, base_freq: float, block_size: int):
+    def __init__(
+        self,
+        head_dim: int,
+        max_seq_len: int,
+        base_freq: float,
+        block_size: int,
+        initial_attn_scale: float = 0.1,
+    ):
         super().__init__()
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.base_freq = base_freq
         self.block_size = block_size
+        self.initial_attn_scale = initial_attn_scale
         self.reset()
 
     def reset(self):
@@ -158,8 +136,8 @@ class Yarn(nn.Module):
         self.cos = nn.Buffer(theta.cos().to(torch.bfloat16), persistent=False)
         self.sin = nn.Buffer(theta.sin().to(torch.bfloat16), persistent=False)
         self.angular_freq = angular_freq
-        # Start with 0.1, inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan
-        self.attn_scale = 0.1
+        # Inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan
+        self.attn_scale = self.initial_attn_scale
 
     def apply(self, old_window: int, new_window: int, alpha: int = 1, beta: int = 32):
         """
@@ -177,6 +155,104 @@ class Yarn(nn.Module):
         self.cos.copy_(theta.cos())
         self.sin.copy_(theta.sin())
         self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
+
+
+class HalfRoPE(PositionalEmbedding):
+    """Half-truncated RoPE without dynamic window adaptation.
+    Based on legacy Rotary class from train_gpt_single_gpu.py."""
+
+    def __init__(
+        self,
+        head_dim: int,
+        max_seq_len: int,
+        base_freq: float = 1024,
+        initial_attn_scale: float = 0.1,
+    ):
+        super().__init__()
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = (1 / base_freq) ** torch.linspace(
+            0, 1, steps=head_dim // 4, dtype=torch.float32
+        )
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(head_dim // 4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.outer(t, angular_freq)
+        self.cos = nn.Buffer(theta.cos().to(torch.bfloat16), persistent=False)
+        self.sin = nn.Buffer(theta.sin().to(torch.bfloat16), persistent=False)
+        self.attn_scale = initial_attn_scale
+
+    def reset(self):
+        pass
+
+    def apply(self, old_window: int, new_window: int):
+        pass
+
+
+class StandardRoPE(PositionalEmbedding):
+    """Full-spectrum RoPE: all head_dim // 2 dimensions get non-zero frequencies."""
+
+    def __init__(
+        self,
+        head_dim: int,
+        max_seq_len: int,
+        base_freq: float = 1024,
+        initial_attn_scale: float = 0.1,
+    ):
+        super().__init__()
+        angular_freq = (1 / base_freq) ** torch.linspace(
+            0, 1, steps=head_dim // 2, dtype=torch.float32
+        )
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.outer(t, angular_freq)
+        self.cos = nn.Buffer(theta.cos().to(torch.bfloat16), persistent=False)
+        self.sin = nn.Buffer(theta.sin().to(torch.bfloat16), persistent=False)
+        self.attn_scale = initial_attn_scale
+
+    def reset(self):
+        pass
+
+    def apply(self, old_window: int, new_window: int):
+        pass
+
+
+class NoPositionalEmbedding(PositionalEmbedding):
+    """Identity positional embedding: cos=1, sin=0 so rotary() is a no-op."""
+
+    def __init__(self, head_dim: int, max_seq_len: int, initial_attn_scale: float = 0.1):
+        super().__init__()
+        self.cos = nn.Buffer(
+            torch.ones(max_seq_len, head_dim // 2, dtype=torch.bfloat16), persistent=False
+        )
+        self.sin = nn.Buffer(
+            torch.zeros(max_seq_len, head_dim // 2, dtype=torch.bfloat16), persistent=False
+        )
+        self.attn_scale = initial_attn_scale
+
+    def reset(self):
+        pass
+
+    def apply(self, old_window: int, new_window: int):
+        pass
+
+
+def create_positional_embedding(rope_config: dict, head_dim: int, max_seq_len: int, block_size: int):
+    """Factory for positional embedding modules."""
+    rope_type = rope_config.get("type", "yarn")
+    base_freq = rope_config.get("base_freq", 1024)
+    initial_attn_scale = rope_config.get("initial_attn_scale", 0.1)
+
+    if rope_type == "yarn":
+        return YarnPositionalEmbedding(
+            head_dim, max_seq_len, base_freq, block_size, initial_attn_scale
+        )
+    if rope_type == "half_rope":
+        return HalfRoPE(head_dim, max_seq_len, base_freq, initial_attn_scale)
+    if rope_type == "rope":
+        return StandardRoPE(head_dim, max_seq_len, base_freq, initial_attn_scale)
+    if rope_type == "none":
+        return NoPositionalEmbedding(head_dim, max_seq_len, initial_attn_scale)
+
+    supported = ["yarn", "half_rope", "rope", "none"]
+    raise ValueError(f"Unsupported rope type: {rope_type!r}. Supported: {', '.join(supported)}")
 
 
 class CausalSelfAttention(nn.Module):
@@ -279,7 +355,7 @@ class CausalSelfAttention(nn.Module):
             return torch.where(mask, score, -float("inf"))
 
         # FlexAttention
-        y = flex_attention(
+        y = _get_flex_attention()(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
@@ -302,59 +378,6 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class MLP(nn.Module):
-    """
-    MLP block matching train_gpt.py structure exactly.
-    Uses raw nn.Parameter with transposed layout and configurable activation.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        c_proj_lr_mul: float,
-        std_scale: float,
-        activation: str = "relu_squared",
-        ffn_dim: int | None = None,
-    ):
-        super().__init__()
-
-        self.activation, self.activation_fn = _get_activation_spec(activation)
-        self.activation_name = _normalize_activation_name(activation)
-
-        if ffn_dim is None:
-            ffn_dim = 4 * dim
-        if self.activation:
-            ffn_dim = int(ffn_dim)
-            c_fc_dim = 2 * ffn_dim
-        else:
-            c_fc_dim = ffn_dim
-
-        # Transposed layout to match attention weights (from train_gpt.py)
-        self.c_fc = nn.Parameter(torch.empty(c_fc_dim, dim))
-        self.c_proj = nn.Parameter(torch.empty(ffn_dim, dim))
-        # Label all modules for explicit optimizer grouping
-        self.c_fc.label = "mlp"
-        self.c_proj.label = "mlp"
-        self.c_proj.lr_mul = c_proj_lr_mul  # Match train_gpt.py
-        self.ffn_dim = ffn_dim
-
-        std = std_scale * (dim**-0.5)
-        bound = (3**0.5) * std  # improved init scale by @YouJiacheng
-        with torch.no_grad():
-            self.c_fc.uniform_(-bound, bound)
-            self.c_proj.zero_()  # zero init suggested by @Grad62304977
-
-    def forward(self, x: Tensor):
-        x = F.linear(x, self.c_fc.type_as(x))
-        if self.activation:
-            x_gate, x_sig = x.chunk(2, dim=-1)
-            x = self.activation_fn(x_gate) * x_sig
-        else:
-            x = self.activation_fn(x)
-        x = F.linear(x, self.c_proj.T.type_as(x))
-        return x
-
-
 class Block(nn.Module):
     def __init__(
         self,
@@ -371,6 +394,8 @@ class Block(nn.Module):
         value_embed_layers: list = None,
         activation: str = "relu_squared",
         ffn_dim: int | None = None,
+        mlp_type: str = "default",
+        mlp_kwargs: dict = None,
     ):
         super().__init__()
         self.dim = dim
@@ -393,15 +418,16 @@ class Block(nn.Module):
         else:
             self.attn = None
 
-        # FFN activation and width are configurable per model_config.
-        self.mlp = MLP(
-            dim,
+        # FFN via factory — mlp_type selects the variant.
+        self.mlp = _create_mlp(
+            mlp_type=mlp_type,
+            dim=dim,
             c_proj_lr_mul=c_proj_lr_mul,
             std_scale=mlp_std_scale,
             activation=activation,
             ffn_dim=ffn_dim,
+            **(mlp_kwargs or {}),
         )
-        # Labels already set inside MLP.__init__()
 
     def forward(
         self,
@@ -421,8 +447,9 @@ class Block(nn.Module):
                 norm(x), ve, sa_lambdas, block_mask, cos, sin, attn_scale, docs, key_offset
             )
             x = x + attn_out
-        # MLP branch
-        mlp_out = self.mlp(norm(x))
+        # MLP branch — variants with internal norms skip the external norm()
+        mlp_input = norm(x) if getattr(self.mlp, "needs_external_norm", True) else x
+        mlp_out = self.mlp(mlp_input)
         x = x + mlp_out
         return x
 
@@ -475,6 +502,8 @@ class GPT(nn.Module):
         block_size = attention_config["block_size"]
         self.activation = model_config.get("activation", "relu_squared")
         self.ffn_dim = model_config.get("ffn_dim", None)
+        mlp_type = model_config.get("mlp_type", "default")
+        mlp_kwargs = model_config.get("mlp_kwargs", {})
 
         # Validate and normalize activation configuration.
         is_glu, _ = _get_activation_spec(self.activation)
@@ -494,9 +523,8 @@ class GPT(nn.Module):
         self.num_layers = num_layers
         self.model_dim = model_dim
 
-        # YaRN for dynamic RoPE adaptation (from train_gpt.py)
-        base_freq = self.rope_config["base_freq"]
-        self.yarn = Yarn(head_dim, max_seq_len, base_freq, block_size)
+        # Positional embedding (YaRN, HalfRoPE, StandardRoPE, or none)
+        self.pos_emb = create_positional_embedding(self.rope_config, head_dim, max_seq_len, block_size)
 
         # Smear gate: shift token embeddings forward (from train_gpt.py @classiclarryd)
         gate_input_dim = self.gating_config["gate_input_dim"]
@@ -544,6 +572,8 @@ class GPT(nn.Module):
                     value_embed_gate_scale=value_embed_gate_scale,
                     activation=self.activation,
                     ffn_dim=self.ffn_dim,
+                    mlp_type=mlp_type,
+                    mlp_kwargs=mlp_kwargs,
                 )
                 for i in range(num_layers)
             ]
@@ -758,9 +788,9 @@ class GPT(nn.Module):
         backout_lambda = self.scalars[3 * self.num_layers + 1]
         skip_lambda = self.scalars[3 * self.num_layers + 2]
 
-        # Get RoPE values from Yarn
-        cos, sin = self.yarn.cos, self.yarn.sin
-        attn_scale = self.yarn.attn_scale
+        # Get RoPE values from positional embedding
+        cos, sin = self.pos_emb.cos, self.pos_emb.sin
+        attn_scale = self.pos_emb.attn_scale
 
         # Skip connections
         skip_connections = []

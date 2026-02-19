@@ -30,7 +30,7 @@ gating_config = dict(
 )
 
 rope_config = dict(
-    use_yarn=True,
+    type="yarn",           # "yarn", "half_rope", "rope", or "none"
     base_freq=1024,
     initial_attn_scale=0.1,
 )
@@ -48,7 +48,7 @@ skip_config = dict(
 
 # Data layout matches the FineWeb shards used by baseline configs.
 TRAIN_SEQ_LEN = 512
-BATCH_SIZE_MULTIPLE = int(os.environ.get("BATCH_SIZE_MULTIPLE", "256"))
+BATCH_SIZE_MULTIPLE = int(os.environ.get("BATCH_SIZE_MULTIPLE", "64"))
 if BATCH_SIZE_MULTIPLE < 1:
     raise ValueError("BATCH_SIZE_MULTIPLE must be >= 1")
 
@@ -199,4 +199,5 @@ logging_config = dict(
 
 compilation_config = dict(
     compile_model=True,
+    relaxed_compile=True,
 )
