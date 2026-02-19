@@ -411,8 +411,8 @@ class Spectron(torch.optim.Optimizer):
 
             u_a = state_a.get("u_vec")
             u_b = state_b.get("u_vec")
-            sigma_a, u_a = _power_iteration_spectral_norm(g_a.float(), u_a, power_iter_steps)
-            sigma_b, u_b = _power_iteration_spectral_norm(g_b.float(), u_b, power_iter_steps)
+            sigma_a, u_a = _power_iteration_spectral_norm(A.float(), u_a, power_iter_steps)
+            sigma_b, u_b = _power_iteration_spectral_norm(B.float(), u_b, power_iter_steps)
             state_a["u_vec"] = u_a
             state_b["u_vec"] = u_b
 

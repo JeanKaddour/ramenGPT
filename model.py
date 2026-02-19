@@ -427,11 +427,14 @@ class CausalSelfAttention(nn.Module):
 
         # Output projection using merged weights with sa_lambdas[1]
         if isinstance(self.qkvo_w, LowRankLinear):
-            o_weight = self.qkvo_w.weight[self.dim * 3 :].type_as(y)
+            o_A = self.qkvo_w.A[self.dim * 3 :, :].type_as(y)
+            y = F.linear(y, self.qkvo_w.B.type_as(y))
+            y = F.linear(y, o_A)
         else:
             o_weight = self.qkvo_w[self.dim * 3 :].type_as(y)
-
-        y = F.linear(y, sa_lambdas[1] * o_weight)
+            y = F.linear(y, sa_lambdas[1] * o_weight)
+        if isinstance(self.qkvo_w, LowRankLinear):
+            y = sa_lambdas[1] * y
         return y
 
 
