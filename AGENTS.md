@@ -33,7 +33,7 @@
 - Prefer small, composable helper functions and preserve existing guard-style assertions for runtime safety.
 - If adding formatting/linting tooling, document it here before adoption (none is currently enforced).
 
-## Testing Guidelines
+## Hyper-parameter sweeping and testing Guidelines
 - **After every newly introduced method or refactor**, run a 10-step smoke test to verify nothing breaks:
   ```bash
   uv run run.py --config config/base.py --early_stop_steps 10 --seed 123
@@ -42,7 +42,7 @@
   - `--early_stop_steps` for bounded runs.
   - `--seed` to verify repeatability.
 - For experiments, keep quick checks on tiny settings before long runs.
-- Treat `wandb` usage as optional in local checks; prefer online runs by default and only use offline mode when explicitly requested or when offline access is required.
+- Treat `wandb` usage as mandatory. Always use online runs by default and only use offline mode when explicitly requested or when offline access is required.
 
 ## Commit & Pull Request Guidelines
 - Commit history uses short, imperative summaries (e.g., `Update README.md...`, `Refactor training loop...`).

@@ -55,6 +55,8 @@ After every newly introduced method or refactor, run a 10-step smoke test to ver
 uv run run.py --config config/base.py --early_stop_steps 10 --seed 123
 ```
 
+Always keep WandB online by default for training runs (including smoke checks), and use offline mode only when explicitly requested or required.
+
 ## Coding Style
 
 - PEP 8 with 4-space indentation, `snake_case` for config keys
