@@ -4,7 +4,11 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from mlps import create_mlp as _create_mlp, _get_activation_spec
+from mlps import (
+    LowRankLinear,
+    create_mlp as _create_mlp,
+    _get_activation_spec,
+)
 
 # FlexAttention compatibility import. Not all environments expose this module.
 try:
@@ -22,6 +26,28 @@ else:
 
 def _get_flex_attention():
     return _compiled_flex_attention or flex_attention
+
+
+def _resolve_low_rank_config(low_rank_config: dict | None) -> dict:
+    if low_rank_config is None or not isinstance(low_rank_config, dict):
+        return {
+            "enabled": False,
+            "rank_ratio": 0.25,
+            "rank": None,
+            "min_rank": 1,
+            "max_rank": None,
+            "apply_attention": True,
+            "apply_mlp": True,
+        }
+    return {
+        "enabled": bool(low_rank_config.get("enabled", False)),
+        "rank_ratio": float(low_rank_config.get("rank_ratio", 0.25)),
+        "rank": low_rank_config.get("rank"),
+        "min_rank": low_rank_config.get("min_rank", 1),
+        "max_rank": low_rank_config.get("max_rank", None),
+        "apply_attention": bool(low_rank_config.get("apply_attention", True)),
+        "apply_mlp": bool(low_rank_config.get("apply_mlp", True)),
+    }
 
 # -----------------------------------------------------------------------------
 # FlexAttention kernel options for different GPU architectures
@@ -266,6 +292,7 @@ class CausalSelfAttention(nn.Module):
         gating_config: dict,
         value_embed_layers: list,
         value_embed_gate_scale: float,
+        low_rank_config: dict | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -274,19 +301,39 @@ class CausalSelfAttention(nn.Module):
         self.layer_idx = layer_idx
         self.value_embed_gate_scale = value_embed_gate_scale
         hdim = num_heads * head_dim
+        low_rank_config = _resolve_low_rank_config(low_rank_config)
 
         assert hdim == dim, "num_heads * head_dim must equal model_dim"
         std = dim**-0.5
         bound = (3**0.5) * std  # improved init scale by @YouJiacheng
 
+        self.low_rank_pairs: list[tuple[Tensor, Tensor]] = []
+
         # Merged QKVO weights (from train_gpt.py)
         # Layout: [Q, K, V, O] each of size (dim, hdim)
-        self.qkvo_w = nn.Parameter(torch.empty(dim * 4, hdim))
-        self.qkvo_w.label = "attn"
-
-        with torch.no_grad():
-            self.qkvo_w[: dim * 3].uniform_(-bound, bound)  # init QKV weights
-            self.qkvo_w[dim * 3 :].zero_()  # init O weights to zero
+        if low_rank_config["enabled"] and low_rank_config["apply_attention"]:
+            self.qkvo_w = LowRankLinear(
+                in_features=hdim,
+                out_features=dim * 4,
+                rank_ratio=low_rank_config["rank_ratio"],
+                rank=low_rank_config["rank"],
+                min_rank=low_rank_config["min_rank"],
+                max_rank=low_rank_config["max_rank"],
+                label="attn",
+                lr_mul=1.0,
+                wd_mul=1.0,
+            )
+            with torch.no_grad():
+                self.qkvo_w.A.uniform_(-bound, bound)
+                self.qkvo_w.B.uniform_(-bound, bound)
+                self.qkvo_w.A[dim * 3 :].zero_()  # init O weights to zero
+            self.low_rank_pairs = [(self.qkvo_w.A, self.qkvo_w.B)]
+        else:
+            self.qkvo_w = nn.Parameter(torch.empty(dim * 4, hdim))
+            self.qkvo_w.label = "attn"
+            with torch.no_grad():
+                self.qkvo_w[: dim * 3].uniform_(-bound, bound)  # init QKV weights
+                self.qkvo_w[dim * 3 :].zero_()  # init O weights to zero
 
         # Sparse gated attention (from train_gpt.py @classiclarryd)
         gate_input_dim = gating_config["gate_input_dim"]
@@ -319,11 +366,16 @@ class CausalSelfAttention(nn.Module):
         assert B == 1, "Must use batch size = 1 for FlexAttention"
 
         # Apply sa_lambdas[0] to QKV weights (from train_gpt.py)
-        q, k, v = (
-            F.linear(x, sa_lambdas[0] * self.qkvo_w[: self.dim * 3].type_as(x))
-            .view(B, T, 3 * self.num_heads, self.head_dim)
-            .chunk(3, dim=-2)
-        )
+        if isinstance(self.qkvo_w, LowRankLinear):
+            qkv = sa_lambdas[0] * self.qkvo_w(x)
+            qkv = qkv[:, :, : self.dim * 3]
+            q, k, v = qkv.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        else:
+            q, k, v = (
+                F.linear(x, sa_lambdas[0] * self.qkvo_w[: self.dim * 3].type_as(x))
+                .view(B, T, 3 * self.num_heads, self.head_dim)
+                .chunk(3, dim=-2)
+            )
 
         # QK norm and RoPE
         q, k = norm(q), norm(k)  # QK norm @Grad62304977
@@ -374,7 +426,12 @@ class CausalSelfAttention(nn.Module):
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
 
         # Output projection using merged weights with sa_lambdas[1]
-        y = F.linear(y, sa_lambdas[1] * self.qkvo_w[self.dim * 3 :].type_as(y))
+        if isinstance(self.qkvo_w, LowRankLinear):
+            o_weight = self.qkvo_w.weight[self.dim * 3 :].type_as(y)
+        else:
+            o_weight = self.qkvo_w[self.dim * 3 :].type_as(y)
+
+        y = F.linear(y, sa_lambdas[1] * o_weight)
         return y
 
 
@@ -396,12 +453,14 @@ class Block(nn.Module):
         ffn_dim: int | None = None,
         mlp_type: str = "default",
         mlp_kwargs: dict = None,
+        low_rank_config: dict | None = None,
     ):
         super().__init__()
         self.dim = dim
         self.layer_idx = layer_idx
         gating_config = gating_config or {}
         value_embed_layers = value_embed_layers or []
+        low_rank_config = low_rank_config or {}
 
         # Skip attention of specific layers (e.g., layer 6 in train_gpt.py) by @YouJiacheng
         if not skip_attention:
@@ -414,6 +473,7 @@ class Block(nn.Module):
                 gating_config,
                 value_embed_layers,
                 value_embed_gate_scale=value_embed_gate_scale,
+                low_rank_config=low_rank_config,
             )
         else:
             self.attn = None
@@ -426,6 +486,7 @@ class Block(nn.Module):
             std_scale=mlp_std_scale,
             activation=activation,
             ffn_dim=ffn_dim,
+            low_rank_config=low_rank_config,
             **(mlp_kwargs or {}),
         )
 
@@ -467,6 +528,7 @@ class GPT(nn.Module):
         skip_config: dict = None,
         rope_config: dict = None,
         embed_config: dict = None,
+        low_rank_config: dict = None,
         wd_multipliers: dict = None,
     ):
         super().__init__()
@@ -478,6 +540,8 @@ class GPT(nn.Module):
         self.skip_config = skip_config or {}
         self.rope_config = rope_config or {}
         self.embed_config = embed_config or {}
+        self.low_rank_config = _resolve_low_rank_config(low_rank_config)
+        self.low_rank_pairs: list[tuple[Tensor, Tensor]] = []
 
         c_proj_lr_mul = lr_multipliers["c_proj"]
         mlp_init_std_scale = model_config["mlp_init_std_scale"]
@@ -575,11 +639,17 @@ class GPT(nn.Module):
                     activation=self.activation,
                     ffn_dim=self.ffn_dim,
                     mlp_type=mlp_type,
+                    low_rank_config=self.low_rank_config,
                     mlp_kwargs=mlp_kwargs,
                 )
                 for i in range(num_layers)
             ]
         )
+
+        for block in self.blocks:
+            if block.attn is not None:
+                self.low_rank_pairs.extend(block.attn.low_rank_pairs)
+            self.low_rank_pairs.extend(getattr(block.mlp, "low_rank_pairs", []))
 
         # LM head with proper initialization
         self.lm_head = CastedLinear(model_dim, vocab_size_padded, use_fp8=False)

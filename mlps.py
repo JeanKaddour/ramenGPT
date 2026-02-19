@@ -37,6 +37,104 @@ def _l2norm(t, dim=-1):
     return F.normalize(t, dim=dim)
 
 
+def _infer_low_rank_rank(in_features, rank_ratio=0.25, rank=None, min_rank=1, max_rank=None):
+    if rank is not None:
+        inferred_rank = int(rank)
+    else:
+        inferred_rank = int(in_features * rank_ratio)
+
+    inferred_rank = max(1, inferred_rank)
+
+    if min_rank is not None:
+        inferred_rank = max(inferred_rank, int(min_rank))
+    if max_rank is not None:
+        inferred_rank = min(inferred_rank, int(max_rank))
+
+    return min(inferred_rank, int(in_features))
+
+
+class LowRankLinear(nn.Module):
+    """Low-rank linear projection with two factor matrices.
+
+    The effective dense weight is ``A @ B`` where:
+      - ``A`` is ``(out_features, rank)``
+      - ``B`` is ``(rank, in_features)``
+
+    Forward pass avoids materializing the dense matrix explicitly.
+    """
+
+    _is_low_rank_linear = True
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank_ratio: float = 0.25,
+        rank: int | None = None,
+        min_rank: int | None = 1,
+        max_rank: int | None = None,
+        label: str | None = None,
+        lr_mul: float = 1.0,
+        wd_mul: float = 1.0,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = _infer_low_rank_rank(
+            in_features=in_features,
+            rank_ratio=rank_ratio,
+            rank=rank,
+            min_rank=min_rank,
+            max_rank=max_rank,
+        )
+
+        self.A = nn.Parameter(torch.empty(out_features, self.rank))
+        self.B = nn.Parameter(torch.empty(self.rank, in_features))
+
+        init_std = (1.0 / max(1, in_features)) ** 0.5
+        with torch.no_grad():
+            self.A.normal_(0.0, init_std)
+            self.B.normal_(0.0, init_std)
+
+        if label is not None:
+            self.A.label = label
+            self.B.label = label
+        self.A.lr_mul = lr_mul
+        self.B.lr_mul = lr_mul
+        self.A.wd_mul = wd_mul
+        self.B.wd_mul = wd_mul
+
+    def materialize(self):
+        return self.A.float().matmul(self.B.float()).to(dtype=self.A.dtype)
+
+    @property
+    def weight(self):
+        return self.materialize()
+
+    def forward(self, x: Tensor):
+        return F.linear(F.linear(x, self.B.type_as(x)), self.A.type_as(x))
+
+
+def _resolve_low_rank_config(low_rank_config: dict | None) -> dict:
+    if low_rank_config is None or not isinstance(low_rank_config, dict):
+        return {
+            "enabled": False,
+            "rank_ratio": 0.25,
+            "rank": None,
+            "min_rank": 1,
+            "max_rank": None,
+            "apply_mlp": True,
+        }
+    return {
+        "enabled": bool(low_rank_config.get("enabled", False)),
+        "rank_ratio": float(low_rank_config.get("rank_ratio", 0.25)),
+        "rank": low_rank_config.get("rank"),
+        "min_rank": low_rank_config.get("min_rank", 1),
+        "max_rank": low_rank_config.get("max_rank", None),
+        "apply_mlp": bool(low_rank_config.get("apply_mlp", True)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # RMSNormWD — weight-decay friendly RMSNorm (renamed to avoid collision with
 # model.py's `norm()` helper)
@@ -325,8 +423,15 @@ class DefaultMLP(nn.Module):
         std_scale: float,
         activation: str = "relu_squared",
         ffn_dim: int | None = None,
+        low_rank_config: dict | None = None,
     ):
         super().__init__()
+
+        self.low_rank_config = _resolve_low_rank_config(low_rank_config)
+        self.use_low_rank = self.low_rank_config["enabled"] and self.low_rank_config.get(
+            "apply_mlp", True
+        )
+        self.low_rank_pairs: list[tuple[Tensor, Tensor]] = []
 
         self.is_glu, self.activation_fn = _get_activation_spec(activation)
 
@@ -337,27 +442,66 @@ class DefaultMLP(nn.Module):
         else:
             c_fc_dim = ffn_dim
 
-        self.c_fc = nn.Parameter(torch.empty(c_fc_dim, dim))
-        self.c_proj = nn.Parameter(torch.empty(ffn_dim, dim))
-        self.c_fc.label = "mlp"
-        self.c_proj.label = "mlp"
-        self.c_proj.lr_mul = c_proj_lr_mul
+        if self.use_low_rank:
+            self.c_fc = LowRankLinear(
+                in_features=dim,
+                out_features=c_fc_dim,
+                rank_ratio=self.low_rank_config["rank_ratio"],
+                rank=self.low_rank_config["rank"],
+                min_rank=self.low_rank_config["min_rank"],
+                max_rank=self.low_rank_config["max_rank"],
+                label="mlp",
+                lr_mul=1.0,
+                wd_mul=1.0,
+            )
+            self.c_proj = LowRankLinear(
+                in_features=ffn_dim,
+                out_features=dim,
+                rank_ratio=self.low_rank_config["rank_ratio"],
+                rank=self.low_rank_config["rank"],
+                min_rank=self.low_rank_config["min_rank"],
+                max_rank=self.low_rank_config["max_rank"],
+                label="mlp",
+                lr_mul=c_proj_lr_mul,
+                wd_mul=1.0,
+            )
+            self.low_rank_pairs = [(self.c_fc.A, self.c_fc.B), (self.c_proj.A, self.c_proj.B)]
+        else:
+            self.c_fc = nn.Parameter(torch.empty(c_fc_dim, dim))
+            self.c_proj = nn.Parameter(torch.empty(ffn_dim, dim))
+            self.c_fc.label = "mlp"
+            self.c_proj.label = "mlp"
+            self.c_proj.lr_mul = c_proj_lr_mul
         self.ffn_dim = ffn_dim
 
         std = std_scale * (dim**-0.5)
         bound = (3**0.5) * std
         with torch.no_grad():
-            self.c_fc.uniform_(-bound, bound)
-            self.c_proj.zero_()
+            if self.use_low_rank:
+                # Scale the low-rank factors with the existing MLP width-aware variance.
+                self.c_fc.A.uniform_(-bound, bound)
+                self.c_fc.B.uniform_(-bound, bound)
+                self.c_proj.A.uniform_(-bound, bound)
+                self.c_proj.B.uniform_(-bound, bound)
+                self.c_proj.B.zero_()
+            else:
+                self.c_fc.uniform_(-bound, bound)
+                self.c_proj.zero_()
 
     def forward(self, x: Tensor):
-        x = F.linear(x, self.c_fc.type_as(x))
+        if self.use_low_rank:
+            x = self.c_fc(x)
+        else:
+            x = F.linear(x, self.c_fc.type_as(x))
         if self.is_glu:
             x_gate, x_sig = x.chunk(2, dim=-1)
             x = self.activation_fn(x_gate) * x_sig
         else:
             x = self.activation_fn(x)
-        x = F.linear(x, self.c_proj.T.type_as(x))
+        if self.use_low_rank:
+            x = self.c_proj(x)
+        else:
+            x = F.linear(x, self.c_proj.T.type_as(x))
         return x
 
 
@@ -618,6 +762,7 @@ def create_mlp(
     std_scale: float,
     activation: str = "relu_squared",
     ffn_dim: int | None = None,
+    low_rank_config: dict | None = None,
     **kwargs,
 ) -> nn.Module:
     """Build an MLP variant.
@@ -629,7 +774,11 @@ def create_mlp(
         raise ValueError(
             f"Unknown mlp_type={mlp_type!r}. Choose from: {', '.join(MLP_TYPES)}"
         )
+    if "low_rank_config" in kwargs:
+        low_rank_config = kwargs.pop("low_rank_config")
     cls = _MLP_REGISTRY[mlp_type]
+    if mlp_type == "default":
+        kwargs["low_rank_config"] = low_rank_config
     return cls(
         dim=dim,
         c_proj_lr_mul=c_proj_lr_mul,

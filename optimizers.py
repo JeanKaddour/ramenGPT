@@ -2,6 +2,10 @@ import torch
 
 
 def create_optimizer(model, optimizer_config: dict, print_fn=print):
+    """
+    Build optimizer state for dense and low-rank parameter groups.
+    Low-rank updates are routed to a dedicated matrix optimizer when requested.
+    """
     # Collect parameter groups - keep logic centralized to match existing behavior.
     hidden_matrix_params = [
         p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n
@@ -10,20 +14,41 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
     scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2 and "x0_lambda" not in n]
     x0_lambda_params = [p for n, p in model.named_parameters() if "x0_lambda" in n]
     head_params = [model.lm_head.weight]
+    low_rank_pairs = getattr(model, "low_rank_pairs", [])
+    low_rank_pairs = [
+        (pair[0], pair[1])
+        for pair in low_rank_pairs
+        if isinstance(pair, (tuple, list)) and len(pair) == 2
+    ]
+    low_rank_param_ids = {id(p) for pair in low_rank_pairs for p in pair}
+    matrix_non_low_rank_params = [
+        p for p in hidden_matrix_params if id(p) not in low_rank_param_ids
+    ]
 
     adam_cfg = optimizer_config["adam"]
     scalar_adam_cfg = optimizer_config.get("scalar_adam", adam_cfg)
     use_muon = optimizer_config.get("use_muon", True)
+    matrix_optimizer_type = optimizer_config.get("matrix_optimizer", "muon")
+    is_spectron = matrix_optimizer_type == "spectron"
 
     optimizers = []
     scalar_opt = None
     matrix_opt = None
-    matrix_optimizer_type = None
     scale_weight_decay_by_lr = optimizer_config.get("apply_lr_scale_to_weight_decay", False)
     if use_muon and len(hidden_matrix_params) > 0:
         # Use Muon/ARO/BAM for hidden matrix parameters if available.
         adam_param_groups = []
-        if head_params + embed_params:
+        if is_spectron and matrix_non_low_rank_params:
+            adam_param_groups.append(
+                {
+                    "params": head_params + embed_params + matrix_non_low_rank_params,
+                    "lr": adam_cfg["lr"],
+                    "betas": adam_cfg["betas"],
+                    "eps": adam_cfg["eps"],
+                    "weight_decay": adam_cfg["weight_decay"],
+                }
+            )
+        elif head_params + embed_params:
             adam_param_groups.append(
                 {
                     "params": head_params + embed_params,
@@ -49,8 +74,43 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
             scalar_opt = Adam(scalar_param_groups, scale_weight_decay_by_lr=scale_weight_decay_by_lr)
             print_fn(f"Created separate scalar optimizer for {len(all_scalar_params)} parameters")
 
-        matrix_optimizer_type = optimizer_config.get("matrix_optimizer", "muon")
-        if matrix_optimizer_type == "aro":
+        if matrix_optimizer_type == "spectron":
+            if len(low_rank_pairs) == 0:
+                print_fn(
+                    "matrix_optimizer='spectron' requested, but no low-rank pairs were discovered; "
+                    "falling back to Muon for hidden matrix parameters."
+                )
+                matrix_optimizer_type = "muon"
+            else:
+                spectron_cfg = optimizer_config.get(
+                    "spectron",
+                    {
+                        "lr": 0.02,
+                        "momentum": 0.95,
+                        "momentum_min": 0.85,
+                        "momentum_warmup_frac": 0.10,
+                        "momentum_cooldown_frac": 0.10,
+                        "beta2": 0.95,
+                        "nesterov": True,
+                        "power_iter_steps": 1,
+                        "ns_iter_steps": 5,
+                    },
+                )
+                matrix_opt = Spectron(
+                    low_rank_pairs,
+                    lr=spectron_cfg["lr"],
+                    momentum=spectron_cfg["momentum"],
+                    beta2=spectron_cfg.get("beta2", 0.95),
+                    weight_decay=spectron_cfg.get("weight_decay", 0.0),
+                    nesterov=spectron_cfg.get("nesterov", True),
+                    power_iter_steps=spectron_cfg.get("power_iter_steps", 1),
+                    ns_iter_steps=spectron_cfg.get("ns_iter_steps", 5),
+                    scale_weight_decay_by_lr=scale_weight_decay_by_lr,
+                )
+                print_fn(
+                    f"Using Spectron optimizer for {len(low_rank_pairs)} low-rank matrix pairs"
+                )
+        elif matrix_optimizer_type == "aro":
             aro_cfg = optimizer_config.get(
                 "aro",
                 {
@@ -122,7 +182,10 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
             )
             print_fn(f"Using NorMuon optimizer for {len(hidden_matrix_params)} matrix parameters")
 
-        optimizers = [adam_opt, matrix_opt]
+        if matrix_opt is not None:
+            optimizers = [adam_opt, matrix_opt]
+        else:
+            optimizers = [adam_opt]
         if scalar_opt:
             optimizers.append(scalar_opt)
 
@@ -174,7 +237,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
 
 
 @torch.compile(dynamic=False, fullgraph=True)
-def polar_express(G: torch.Tensor):
+def polar_express(G: torch.Tensor, num_iters: int | None = None):
     """Polar Express sign method for orthogonalization."""
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
@@ -192,7 +255,9 @@ def polar_express(G: torch.Tensor):
     # Ensure spectral norm is at most 1.
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
 
-    for a, b, c in polar_express_coeffs:
+    if num_iters is None:
+        num_iters = len(polar_express_coeffs)
+    for a, b, c in polar_express_coeffs[: num_iters]:
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -215,6 +280,165 @@ def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
     return v_chunk.mul_(final_scale.type_as(v_chunk))
+
+
+@torch.no_grad()
+def _power_iteration_spectral_norm(matrix: torch.Tensor, vec_state: torch.Tensor | None, num_iters=1):
+    if matrix.ndim != 2:
+        raise ValueError("power iteration expects a 2D matrix")
+
+    if matrix.numel() == 0:
+        zero_vec = torch.zeros(matrix.size(0), device=matrix.device, dtype=torch.float32)
+        return torch.tensor(0.0, device=matrix.device, dtype=torch.float32), zero_vec
+
+    m_float = matrix.to(dtype=torch.float64)
+    if not torch.isfinite(m_float).all():
+        m_float = torch.nan_to_num(m_float, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if vec_state is None or vec_state.numel() != matrix.size(0):
+        u = torch.randn(matrix.size(0), device=matrix.device, dtype=torch.float64)
+    else:
+        u = vec_state.to(dtype=torch.float64)
+
+    u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
+    if u.numel() == 0:
+        return torch.tensor(0.0, device=matrix.device, dtype=torch.float32), torch.zeros_like(u)
+
+    u_norm = u.norm()
+    if not torch.isfinite(u_norm) or u_norm <= 0:
+        u = torch.ones_like(u)
+        u_norm = u.norm()
+    u = u / (u_norm + 1e-12)
+
+    for _ in range(max(1, int(num_iters))):
+        v = torch.mv(m_float.T, u)
+        if not torch.isfinite(v).all():
+            v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+        v_norm = v.norm()
+        if not torch.isfinite(v_norm) or v_norm <= 0:
+            return torch.tensor(0.0, device=matrix.device, dtype=torch.float32), u
+        v = v / (v_norm + 1e-12)
+
+        u = torch.mv(m_float, v)
+        if not torch.isfinite(u).all():
+            u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
+        u_norm = u.norm()
+        if not torch.isfinite(u_norm) or u_norm <= 0:
+            return torch.tensor(0.0, device=matrix.device, dtype=torch.float32), v
+        u = u / (u_norm + 1e-12)
+
+    sigma_vec = torch.mv(m_float, v)
+    if not torch.isfinite(sigma_vec).all():
+        sigma_vec = torch.nan_to_num(sigma_vec, nan=0.0, posinf=0.0, neginf=0.0)
+    sigma = sigma_vec.norm().to(dtype=torch.float64)
+    sigma = torch.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
+    return sigma.to(dtype=torch.float32), u.to(dtype=torch.float32)
+
+
+class Spectron(torch.optim.Optimizer):
+    """
+    Spectral renormalization + orthogonalization for low-rank matrix factors.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        momentum=0.95,
+        beta2=0.95,
+        weight_decay=0.0,
+        nesterov=True,
+        power_iter_steps=1,
+        ns_iter_steps=5,
+        scale_weight_decay_by_lr=False,
+    ):
+        if params is None:
+            params = []
+        pair_params = list(params)
+        for pair in pair_params:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError("Spectron expects an iterable of parameter pairs.")
+        param_groups = [{"params": [A, B]} for A, B in pair_params]
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            beta2=beta2,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            power_iter_steps=max(1, int(power_iter_steps)),
+            ns_iter_steps=max(1, int(ns_iter_steps)),
+            scale_weight_decay_by_lr=scale_weight_decay_by_lr,
+        )
+        super().__init__(param_groups, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            scale_weight_decay_by_lr = group["scale_weight_decay_by_lr"]
+            power_iter_steps = group["power_iter_steps"]
+            ns_iter_steps = group["ns_iter_steps"]
+
+            pair = group["params"]
+            if len(pair) != 2:
+                raise RuntimeError("Spectron parameter groups must contain exactly two parameters.")
+            A, B = pair
+            if A.grad is None or B.grad is None:
+                continue
+
+            state_a = self.state[A]
+            state_b = self.state[B]
+
+            # Momentum buffers
+            if "momentum_buffer" not in state_a:
+                state_a["momentum_buffer"] = torch.zeros_like(A.grad)
+            if "momentum_buffer" not in state_b:
+                state_b["momentum_buffer"] = torch.zeros_like(B.grad)
+
+            buf_a = state_a["momentum_buffer"]
+            buf_b = state_b["momentum_buffer"]
+
+            buf_a.lerp_(A.grad, 1 - group["momentum"])
+            buf_b.lerp_(B.grad, 1 - group["momentum"])
+
+            g_a = A.grad.lerp_(buf_a, group["momentum"]) if group["nesterov"] else buf_a
+            g_b = B.grad.lerp_(buf_b, group["momentum"]) if group["nesterov"] else buf_b
+
+            # Update orthogonality and estimate spectral norms.
+            g_a = polar_express(g_a, num_iters=ns_iter_steps)
+            g_b = polar_express(g_b, num_iters=ns_iter_steps)
+
+            u_a = state_a.get("u_vec")
+            u_b = state_b.get("u_vec")
+            sigma_a, u_a = _power_iteration_spectral_norm(g_a.float(), u_a, power_iter_steps)
+            sigma_b, u_b = _power_iteration_spectral_norm(g_b.float(), u_b, power_iter_steps)
+            state_a["u_vec"] = u_a
+            state_b["u_vec"] = u_b
+
+            lr_mul = max(getattr(A, "lr_mul", 1.0), getattr(B, "lr_mul", 1.0))
+            eff_lr = lr * lr_mul
+            sigma_sum = sigma_a + sigma_b + 1.0
+            if not torch.isfinite(sigma_sum):
+                sigma_sum = torch.tensor(1.0, device=A.device, dtype=A.dtype)
+            scale = eff_lr / sigma_sum.clamp_min(1e-8)
+
+            wd_mul = max(getattr(A, "wd_mul", 1.0), getattr(B, "wd_mul", 1.0))
+            eff_wd = wd * wd_mul
+            if scale_weight_decay_by_lr:
+                eff_wd *= lr
+
+            delta_a = (g_a.to(dtype=A.dtype)) * scale
+            delta_b = (g_b.to(dtype=B.dtype)) * scale
+
+            if eff_wd != 0:
+                mask_a = (delta_a * A) >= 0
+                mask_b = (delta_b * B) >= 0
+                A.addcmul_(A, mask_a, value=-eff_wd * scale)
+                B.addcmul_(B, mask_b, value=-eff_wd * scale)
+
+            A.add_(delta_a, alpha=-1.0)
+            B.add_(delta_b, alpha=-1.0)
 
 
 class Adam(torch.optim.Optimizer):

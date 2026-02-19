@@ -523,6 +523,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     lambda_config = getattr(config, "lambda_config", None)
     lr_multipliers = optimizer_config.get("lr_multipliers", {})
     wd_multipliers = optimizer_config.get("wd_multipliers", {})
+    low_rank_config = getattr(config, "low_rank_config", None)
 
     # New config sections for train_gpt.py alignment
     gating_config = getattr(config, "gating_config", None)
@@ -579,6 +580,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         rope_config=rope_config,
         embed_config=embed_config,
         wd_multipliers=wd_multipliers,
+        low_rank_config=low_rank_config,
     ).cuda()
     # Convert all weights to bfloat16 (from train_gpt.py)
     for m in model.modules():
@@ -678,7 +680,16 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         # Generate automatic run name if not specified
         if logging_config["wandb_run_name"] is None:
-            wandb_run_name = f"{model_type}_{model_size_info}_{param_info}_{seq_len_info}{activation_info}_{batch_info}"
+            matrix_optimizer_prefix = (
+                "spectron"
+                if matrix_optimizer_type == "spectron"
+                else "no_spectron"
+            )
+            wandb_run_name = (
+                f"{model_type}_{matrix_optimizer_prefix}_"
+                f"{model_size_info}_{param_info}_{seq_len_info}"
+                f"{activation_info}_{batch_info}"
+            )
         else:
             wandb_run_name = logging_config["wandb_run_name"]
 
@@ -695,7 +706,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
 
         # Add optimizer info to tags
         if optimizer2 is not None:
-            tags.append("muon_adam")
+            tags.append(f"{matrix_optimizer_type or 'matrix'}_matrix")
         else:
             tags.append("adam_only")
 
@@ -705,6 +716,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             **training_config,
             **optimizer_config,
             **batch_schedule_config,
+            "low_rank_config": low_rank_config or {},
             "config_file": args.config,
             "batch_size_multiple": micro_batch_size,
             "micro_batch_size": micro_batch_size,

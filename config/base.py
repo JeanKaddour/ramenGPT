@@ -96,7 +96,7 @@ training_config = dict(
 
 optimizer_config = dict(
     use_muon=True,
-    matrix_optimizer="muon",  # "muon", "aro", or "bam"
+    matrix_optimizer="muon",  # "muon", "spectron", "aro", or "bam"
     apply_lr_scale_to_weight_decay=False,
     adam=dict(
         lr=0.006,
@@ -140,6 +140,18 @@ optimizer_config = dict(
         nesterov=True,
         sink_steps=1,
     ),
+    spectron=dict(
+        lr=0.02,
+        weight_decay=1.2,
+        momentum=0.95,
+        momentum_min=0.85,
+        momentum_warmup_frac=0.10,
+        momentum_cooldown_frac=0.10,
+        beta2=0.95,
+        nesterov=True,
+        power_iter_steps=1,
+        ns_iter_steps=5,
+    ),
     lr_multipliers=dict(
         embed=1.0,
         value_embed=75.0,
@@ -160,6 +172,16 @@ optimizer_config = dict(
         skip_gate=0.0,
     ),
     freeze_scalars_on_transition=8,
+)
+
+low_rank_config = dict(
+    enabled=False,
+    rank_ratio=0.25,
+    rank=None,
+    min_rank=1,
+    max_rank=None,
+    apply_attention=True,
+    apply_mlp=True,
 )
 
 # FlexAttention setup
