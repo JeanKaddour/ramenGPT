@@ -524,6 +524,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     lr_multipliers = optimizer_config.get("lr_multipliers", {})
     wd_multipliers = optimizer_config.get("wd_multipliers", {})
     low_rank_config = getattr(config, "low_rank_config", None)
+    residual_connection_config = getattr(config, "residual_connection_config", None)
 
     # New config sections for train_gpt.py alignment
     gating_config = getattr(config, "gating_config", None)
@@ -557,6 +558,16 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         training_config["checkpoint_every"] = args.checkpoint_every
         print(f"Override: checkpoint_every = {args.checkpoint_every}")
 
+    if args.residual_connection_mode is not None:
+        residual_connection_config = residual_connection_config or {}
+        residual_connection_config["mode"] = args.residual_connection_mode
+        print(f"Override: residual_connection.mode = {args.residual_connection_mode}")
+
+    if args.residual_connection_num_streams is not None:
+        residual_connection_config = residual_connection_config or {}
+        residual_connection_config["num_streams"] = args.residual_connection_num_streams
+        print(f"Override: residual_connection.num_streams = {args.residual_connection_num_streams}")
+
     # Configure model backend features tied to GPU architecture.
     set_flex_attention_kernel_options(detected_gpu_info.get("architecture"))
 
@@ -579,6 +590,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         skip_config=skip_config,
         rope_config=rope_config,
         embed_config=embed_config,
+        residual_connection_config=residual_connection_config,
         wd_multipliers=wd_multipliers,
         low_rank_config=low_rank_config,
     ).cuda()
@@ -678,6 +690,12 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         }.get(activation_name, activation_name)
         activation_info = f"_{activation_short}"
 
+        residual_connection_config = residual_connection_config or {}
+        residual_connection_mode = residual_connection_config.get("mode", "standard").lower()
+        residual_num_streams = int(residual_connection_config.get("num_streams", 1))
+        residual_num_fracs = int(residual_connection_config.get("num_fracs", 1))
+        residual_info = f"res-{residual_connection_mode}-s{residual_num_streams}-f{residual_num_fracs}"
+
         # Generate automatic run name if not specified
         if logging_config["wandb_run_name"] is None:
             matrix_optimizer_prefix = (
@@ -688,7 +706,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             wandb_run_name = (
                 f"{model_type}_{matrix_optimizer_prefix}_"
                 f"{model_size_info}_{param_info}_{seq_len_info}"
-                f"{activation_info}_{batch_info}"
+                f"{activation_info}_{batch_info}_{residual_info}"
             )
         else:
             wandb_run_name = logging_config["wandb_run_name"]
@@ -727,6 +745,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             "total_params": total_params,
             "early_stop_steps": args.early_stop_steps,
             "activation": activation_name,  # Explicitly track activation function
+            "residual_connection_config": residual_connection_config or {},
         }
 
         wandb.init(

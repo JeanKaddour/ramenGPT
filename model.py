@@ -1,8 +1,14 @@
 import math
+from functools import partial
+from random import randrange
+from typing import Callable
 
 import torch
-from torch import Tensor, nn
+from torch import Tensor, cat, nn
 import torch.nn.functional as F
+
+from einops import einsum, reduce, rearrange, repeat
+from einops.layers.torch import Rearrange, Reduce
 
 from mlps import (
     LowRankLinear,
@@ -81,6 +87,520 @@ def norm(x: Tensor):
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
+
+def exists(v):
+    return v is not None
+
+
+def divisible_by(num, den):
+    return (num % den) == 0
+
+
+def default(v, d):
+    return v if exists(v) else d
+
+
+def identity(t):
+    return t
+
+
+def add(x, y):
+    return x + y
+
+
+def sinkhorn_log(logits, num_iters=10, tau=0.05):
+    n = logits.shape[-1]
+    Z = logits / tau
+    log_marginal = torch.full(
+        (n,), -math.log(n), device=logits.device, dtype=logits.dtype
+    )
+
+    u = torch.zeros(n, device=Z.device, dtype=Z.dtype)
+    v = torch.zeros(n, device=Z.device, dtype=Z.dtype)
+
+    for _ in range(num_iters):
+        u = log_marginal - torch.logsumexp(Z + v.unsqueeze(0), dim=1)
+        v = log_marginal - torch.logsumexp(Z + u.unsqueeze(1), dim=0)
+
+    return torch.exp(Z + u.unsqueeze(1) + v.unsqueeze(0)) * n
+
+
+def zeropower_via_newtonschulz(X, steps=5, eps=1e-7, coeffs=(3.0, -3.2, 1.2)):
+    a, b, c = coeffs
+
+    X = X / (X.norm() + eps)
+
+    transpose = False
+    if X.shape[0] > X.shape[1]:
+        X = X.T
+        transpose = True
+
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if transpose:
+        X = X.T
+
+    return X
+
+
+def orthostochastic_project(logits, ns_steps=5, ns_eps=1e-7, ns_coeffs=(3.0, -3.2, 1.2)):
+    O = zeropower_via_newtonschulz(logits, steps=ns_steps, eps=ns_eps, coeffs=ns_coeffs)
+    return O.square()
+
+
+# -------------------------------------------------------------------------
+# Residual stream connections
+# Adapted from:
+# https://github.com/tokenbender/mHC-manifold-constrained-hyper-connections
+# -------------------------------------------------------------------------
+
+
+def get_expand_reduce_stream_functions(
+    num_streams, add_stream_embed=False, dim=None, disable=False
+):
+    if num_streams == 1 or disable:
+        return (nn.Identity(), nn.Identity())
+
+    if add_stream_embed:
+        assert exists(dim), (
+            "`dim` must be passed into get_init_and_expand_reduce_stream_functions for returning "
+            "an expansion function with stream embeddings added"
+        )
+        expand_fn = StreamEmbed(num_streams, dim, expand_to_streams=True)
+    else:
+        expand_fn = _RepeatExpand(num_streams)
+
+    reduce_fn = Reduce(pattern="(b s) ... -> b ...", reduction="sum", s=num_streams)
+
+    return expand_fn, reduce_fn
+
+
+class _RepeatExpand(nn.Module):
+    def __init__(self, num_streams: int):
+        super().__init__()
+        self.num_streams = num_streams
+
+    def forward(self, residuals):
+        return repeat(residuals, "b ... -> (b s) ...", s=self.num_streams)
+
+
+def get_init_and_expand_reduce_stream_functions(
+    num_streams, num_fracs=1, dim=None, add_stream_embed=False, disable=None
+):
+    disable = default(disable, num_streams == 1 and num_fracs == 1)
+
+    hyper_conn_klass = HyperConnections if not disable else Residual
+
+    init_hyper_conn_fn = partial(hyper_conn_klass, num_streams, num_fracs=num_fracs)
+    expand_reduce_fns = get_expand_reduce_stream_functions(
+        num_streams, add_stream_embed=add_stream_embed, dim=dim, disable=disable
+    )
+
+    if exists(dim):
+        init_hyper_conn_fn = partial(init_hyper_conn_fn, dim=dim)
+
+    return (init_hyper_conn_fn, *expand_reduce_fns)
+
+
+# norms
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.scale = dim ** 0.5
+        self.gamma = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        return F.normalize(x, dim=-1) * self.scale * (self.gamma + 1)
+
+
+class Residual(nn.Module):
+    def __init__(
+        self,
+        *args,
+        branch=None,
+        residual_transform=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.branch = branch
+        self.residual_transform = default(residual_transform, nn.Identity())
+
+    def width_connection(self, residuals):
+        return residuals, residuals, dict()
+
+    def depth_connection(self, branch_output, residuals):
+        return branch_output + self.residual_transform(residuals)
+
+    def decorate_branch(self, branch: Callable):
+        assert not exists(self.branch), "branch was already wrapped on init"
+
+        def forward_and_add_residual(residual, *args, **kwargs):
+            branch_input, add_residual = self.forward(residual)
+
+            branch_output = branch(branch_input, *args, **kwargs)
+
+            residual = add_residual(branch_output)
+
+            return residual
+
+        return forward_and_add_residual
+
+    def forward(self, residuals, *branch_args, **branch_kwargs):
+        branch_input, residuals, residual_kwargs = self.width_connection(residuals)
+
+        def add_residual_fn(branch_out):
+            (branch_out, *rest), tree_spec = torch.utils._pytree.tree_flatten(branch_out)
+
+            branch_out = self.depth_connection(branch_out, residuals, **residual_kwargs)
+
+            return torch.utils._pytree.tree_unflatten((branch_out, *rest), tree_spec)
+
+        if not exists(self.branch):
+            return branch_input, add_residual_fn
+
+        branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
+
+        return add_residual_fn(branch_output)
+
+
+class HyperConnections(nn.Module):
+    """Residual stream connection module from mHC-hyper-connections."""
+
+    def __init__(
+        self,
+        num_residual_streams,
+        *,
+        dim,
+        branch=None,
+        layer_index=None,
+        tanh=True,
+        channel_first=False,
+        dropout=0.0,
+        residual_transform=None,
+        add_branch_out_to_residual=True,
+        num_input_views=1,
+        depth_residual_fn=add,
+        num_fracs=1,
+        mhc=False,
+        sinkhorn_iters=10,
+        sinkhorn_tau=0.05,
+        mhc_h_res_proj="sinkhorn",
+        ns_steps=5,
+        ns_eps=1e-7,
+        ns_coeffs=(3.0, -3.2, 1.2),
+        mhc_residual_identity_mix=False,
+        mhc_residual_alpha=0.01,
+    ):
+        super().__init__()
+
+        self.branch = branch
+        self.act = nn.Tanh() if tanh else nn.Identity()
+        self.has_fracs = num_fracs > 1
+        self.num_fracs = num_fracs
+        self.split_fracs = Rearrange("b ... (f d) -> b ... f d", f=num_fracs)
+        self.merge_fracs = Rearrange("b ... f d -> b ... (f d)")
+        self.norm = RMSNorm(dim // num_fracs)
+
+        assert num_residual_streams > 0, "`num_residual_streams` must be greater than 0"
+        self.num_residual_streams = num_residual_streams
+        init_residual_index = (
+            default(layer_index, randrange(num_residual_streams)) % num_residual_streams
+        )
+
+        assert divisible_by(dim, num_fracs), (
+            f"feature dimension ({dim}) must be divisible by the `num_fracs` ({num_fracs})"
+        )
+        dim //= num_fracs
+
+        num_residual_streams_fracs = num_residual_streams * num_fracs
+        num_input_views_fracs = num_input_views * num_fracs
+
+        assert num_input_views >= 1
+        self.num_input_views = num_input_views
+
+        init_alpha0 = torch.zeros((num_residual_streams_fracs, num_input_views_fracs))
+        init_alpha0[init_residual_index, :] = 1.0
+        self.static_alpha = nn.Parameter(
+            cat((init_alpha0, torch.eye(num_residual_streams_fracs)), dim=1)
+        )
+        self.dynamic_alpha_fn = nn.Parameter(
+            torch.zeros(dim, num_residual_streams_fracs + num_input_views_fracs)
+        )
+        self.dynamic_alpha_scale = nn.Parameter(torch.ones(()) * 1e-2)
+
+        self.add_branch_out_to_residual = add_branch_out_to_residual
+        if add_branch_out_to_residual:
+            self.static_beta = nn.Parameter(torch.ones(num_residual_streams_fracs))
+
+            dynamic_beta_shape = (dim,) if num_fracs == 1 else (dim, num_fracs)
+            self.dynamic_beta_fn = nn.Parameter(torch.zeros(dynamic_beta_shape))
+            self.dynamic_beta_scale = nn.Parameter(torch.ones(()) * 1e-2)
+
+        self.dropout = nn.Dropout(dropout)
+        self.channel_first = channel_first
+        self.residual_transform = default(residual_transform, nn.Identity())
+        self.depth_residual_fn = depth_residual_fn
+
+        self.mhc = mhc
+        self.sinkhorn_iters = sinkhorn_iters
+        self.sinkhorn_tau = sinkhorn_tau
+        self.mhc_h_res_proj = mhc_h_res_proj
+        self.ns_steps = ns_steps
+        self.ns_eps = ns_eps
+        self.ns_coeffs = ns_coeffs
+        self.mhc_residual_identity_mix = mhc_residual_identity_mix
+
+        if mhc:
+            assert num_fracs == 1, "mhc currently requires num_fracs = 1"
+            assert num_input_views == 1, "mhc currently requires num_input_views = 1"
+            assert mhc_h_res_proj in ("sinkhorn", "orthostochastic"), (
+                "mhc_h_res_proj must be 'sinkhorn' or 'orthostochastic'"
+            )
+
+            H_res_init = torch.full((num_residual_streams, num_residual_streams), -8.0)
+            H_res_init.fill_diagonal_(0.0)
+            self.H_res_logits = nn.Parameter(H_res_init)
+
+            H_pre_init = torch.full((num_residual_streams,), -8.0)
+            H_pre_init[init_residual_index] = 0.0
+            self.H_pre_logits = nn.Parameter(H_pre_init)
+
+            if add_branch_out_to_residual:
+                self.H_post_logits = nn.Parameter(torch.zeros(num_residual_streams))
+
+            if mhc_residual_identity_mix:
+                alpha_clamped = max(1e-4, min(1 - 1e-4, mhc_residual_alpha))
+                alpha_logit_init = math.log(alpha_clamped / (1 - alpha_clamped))
+                self.H_res_alpha_logit = nn.Parameter(torch.tensor(alpha_logit_init))
+
+    def width_connection(self, residuals):
+        residual_dtype = residuals.dtype
+        streams = self.num_residual_streams
+        residuals_mixed_source = None
+        if self.mhc:
+            residuals_mixed_source = self.residual_transform(residuals)
+
+        if self.channel_first:
+            residuals = rearrange(residuals, "b d ... -> b ... d")
+
+        residuals = self.split_fracs(residuals)
+        residuals = rearrange(residuals, "(b s) ... d -> b ... s d", s=streams)
+
+        if self.mhc:
+            if self.channel_first:
+                residuals_mixed_source = rearrange(residuals_mixed_source, "b d ... -> b ... d")
+
+            residuals_mixed_source = self.split_fracs(residuals_mixed_source)
+            residuals_mixed_source = rearrange(
+                residuals_mixed_source, "(b s) ... d -> b ... s d", s=streams
+            )
+            residuals_mixed_source = residuals_mixed_source.to(residual_dtype)
+
+            if self.mhc_h_res_proj == "orthostochastic":
+                S = orthostochastic_project(
+                    self.H_res_logits,
+                    ns_steps=self.ns_steps,
+                    ns_eps=self.ns_eps,
+                    ns_coeffs=self.ns_coeffs,
+                ).to(residual_dtype)
+            else:
+                S = sinkhorn_log(self.H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau).to(
+                    residual_dtype
+                )
+
+            if self.mhc_residual_identity_mix:
+                alpha = torch.sigmoid(self.H_res_alpha_logit)
+                I = torch.eye(streams, device=S.device, dtype=S.dtype)
+                H_res = (1 - alpha) * I + alpha * S
+            else:
+                H_res = S
+
+            H_pre = F.softmax(self.H_pre_logits, dim=-1).to(residual_dtype)
+            H_post = None
+            if self.add_branch_out_to_residual:
+                H_post = F.softmax(self.H_post_logits, dim=-1).to(residual_dtype)
+
+            residuals_mixed = einsum(
+                H_res, residuals_mixed_source, "s t, ... s d -> ... t d"
+            )
+            branch_input = einsum(H_pre, residuals, "s, ... s d -> ... d")
+
+            if self.channel_first:
+                branch_input = rearrange(branch_input, "b ... d -> b d ...")
+
+            branch_input = self.merge_fracs(branch_input)
+            residuals_out = rearrange(residuals_mixed, "b ... s d -> (b s) ... d")
+            residuals_out = self.merge_fracs(residuals_out)
+
+            if self.channel_first:
+                residuals_out = rearrange(residuals_out, "b ... d -> b d ...")
+
+            return (
+                branch_input,
+                residuals_out,
+                dict(beta=H_post, residuals_mixed=residuals_mixed),
+            )
+
+        normed = self.norm(residuals).to(self.dynamic_alpha_fn.dtype)
+        wc_weight = self.act(normed @ self.dynamic_alpha_fn)
+        dynamic_alpha = wc_weight * self.dynamic_alpha_scale
+        static_alpha = rearrange(self.static_alpha, "(f s) d -> f s d", s=streams)
+        alpha = (dynamic_alpha + static_alpha).to(residual_dtype)
+        alpha = self.split_fracs(alpha)
+
+        beta = None
+        if self.add_branch_out_to_residual:
+            dc_weight = self.act(normed @ self.dynamic_beta_fn)
+            if not self.has_fracs:
+                dc_weight = rearrange(dc_weight, "... -> ... 1")
+
+            dynamic_beta = dc_weight * self.dynamic_beta_scale
+            static_beta = rearrange(self.static_beta, "... (s f) -> ... s f", s=streams).to(
+                residual_dtype
+            )
+            beta = dynamic_beta + static_beta
+
+        mix_h = einsum(alpha, residuals, "... f1 s f2 t, ... f1 s d -> ... f2 t d")
+        if self.num_input_views == 1:
+            branch_input, residuals = mix_h[..., 0, :], mix_h[..., 1:, :]
+        else:
+            branch_input, residuals = (
+                mix_h[..., : self.num_input_views, :],
+                mix_h[..., self.num_input_views :, :],
+            )
+            branch_input = rearrange(branch_input, "b ... v d -> v b ... d")
+
+        if self.channel_first:
+            branch_input = rearrange(branch_input, "b ... d -> b d ...")
+
+        branch_input = self.merge_fracs(branch_input)
+        residuals = rearrange(residuals, "b ... s d -> (b s) ... d")
+        residuals = self.merge_fracs(residuals)
+
+        if self.channel_first:
+            residuals = rearrange(residuals, "b ... d -> b d ...")
+
+        residuals = self.residual_transform(residuals)
+        return branch_input, residuals, dict(beta=beta)
+
+    def depth_connection(self, branch_output, residuals, *, beta, residuals_mixed=None):
+        assert self.add_branch_out_to_residual
+
+        branch_output = self.split_fracs(branch_output)
+        if self.channel_first:
+            branch_output = rearrange(branch_output, "b d ... -> b ... d")
+
+        if self.mhc:
+            assert residuals_mixed is not None
+            assert beta is not None
+            beta = beta.to(branch_output.dtype)
+            branch_to_streams = einsum(branch_output, beta, "b ... d, s -> b ... s d")
+            output = residuals_mixed + branch_to_streams
+            output = rearrange(output, "b ... s d -> (b s) ... d")
+            output = self.merge_fracs(output)
+
+            if self.channel_first:
+                output = rearrange(output, "b ... d -> b d ...")
+
+            return self.dropout(output)
+
+        output = einsum(
+            branch_output,
+            beta.to(branch_output.dtype),
+            "b ... f1 d, b ... f1 s f2 -> b ... f2 s d",
+        )
+        output = rearrange(output, "b ... s d -> (b s) ... d")
+        output = self.merge_fracs(output)
+
+        if self.channel_first:
+            output = rearrange(output, "b ... d -> b d ...")
+
+        residuals = self.depth_residual_fn(output, residuals)
+        return self.dropout(residuals)
+
+    def forward(self, residuals, *branch_args, **branch_kwargs):
+        branch_input, residuals, residual_kwargs = self.width_connection(residuals)
+
+        def add_residual_fn(branch_out):
+            if not self.add_branch_out_to_residual:
+                return branch_out
+
+            (branch_out, *rest), tree_spec = torch.utils._pytree.tree_flatten(branch_out)
+
+            branch_out = self.depth_connection(branch_out, residuals, **residual_kwargs)
+
+            return torch.utils._pytree.tree_unflatten((branch_out, *rest), tree_spec)
+
+        if not exists(self.branch):
+            return branch_input, add_residual_fn
+
+        branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
+
+        return add_residual_fn(branch_output)
+
+
+HyperConnections.get_expand_reduce_stream_functions = staticmethod(
+    get_expand_reduce_stream_functions
+)
+HyperConnections.get_init_and_expand_reduce_stream_functions = staticmethod(
+    get_init_and_expand_reduce_stream_functions
+)
+
+
+class StreamEmbed(nn.Module):
+    def __init__(self, num_streams, dim, channel_first=False, expand_to_streams=False):
+        super().__init__()
+        self.channel_first = channel_first
+        self.num_streams = num_streams
+        self.expand_to_streams = expand_to_streams
+        self.stream_embed = nn.Parameter(torch.zeros(num_streams, dim))
+
+    def forward(self, residuals):
+        if self.expand_to_streams:
+            residuals = repeat(residuals, "b ... -> (b s) ...", s=self.num_streams)
+
+        if self.channel_first:
+            residuals = rearrange(residuals, "(b s) d ... -> b ... s d", s=self.num_streams)
+        else:
+            residuals = rearrange(residuals, "(b s) ... d -> b ... s d", s=self.num_streams)
+
+        residuals = residuals + self.stream_embed
+
+        if self.channel_first:
+            residuals = rearrange(residuals, "b ... s d -> (b s) d ...", s=self.num_streams)
+        else:
+            residuals = rearrange(residuals, "b ... s d -> (b s) ... d", s=self.num_streams)
+
+        return residuals
+
+
+class AttentionPoolReduceStream(nn.Module):
+    def __init__(self, num_streams, dim, channel_first=False):
+        super().__init__()
+        self.num_streams = num_streams
+        self.channel_first = channel_first
+        self.to_attn_logits = nn.Linear(dim, dim, bias=False)
+        self.to_attn_logits.weight.data.copy_(torch.eye(dim))
+
+    def forward(self, residuals):
+        if self.channel_first:
+            residuals = rearrange(residuals, "(b s) d ... -> b ... s d", s=self.num_streams)
+        else:
+            residuals = rearrange(residuals, "(b s) ... d -> b ... s d", s=self.num_streams)
+
+        attn_logits = self.to_attn_logits(residuals)
+        attn = attn_logits.softmax(dim=-2)
+        residuals = reduce(residuals * attn, "b ... s d -> b ... d", "sum")
+
+        if self.channel_first:
+            residuals = rearrange(residuals, "b ... d -> b d ...")
+        return residuals
 
 
 def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
@@ -363,8 +883,6 @@ class CausalSelfAttention(nn.Module):
         key_offset: bool = False,
     ):
         B, T = x.size(0), x.size(1)
-        assert B == 1, "Must use batch size = 1 for FlexAttention"
-
         # Apply sa_lambdas[0] to QKV weights (from train_gpt.py)
         if isinstance(self.qkvo_w, LowRankLinear):
             qkv = sa_lambdas[0] * self.qkvo_w(x)
@@ -457,6 +975,7 @@ class Block(nn.Module):
         mlp_type: str = "default",
         mlp_kwargs: dict = None,
         low_rank_config: dict | None = None,
+        residual_connection: nn.Module = None,
     ):
         super().__init__()
         self.dim = dim
@@ -492,8 +1011,9 @@ class Block(nn.Module):
             low_rank_config=low_rank_config,
             **(mlp_kwargs or {}),
         )
+        self.residual_connection = residual_connection
 
-    def forward(
+    def _forward_standard(
         self,
         x: Tensor,
         ve: Tensor,
@@ -517,6 +1037,54 @@ class Block(nn.Module):
         x = x + mlp_out
         return x
 
+    def _forward_delta(
+        self,
+        x: Tensor,
+        ve: Tensor,
+        sa_lambdas: Tensor,
+        block_mask,
+        cos: Tensor,
+        sin: Tensor,
+        attn_scale: float,
+        docs: Tensor,
+        key_offset: bool = False,
+    ):
+        residual = x
+
+        # Attention branch
+        if self.attn is not None:
+            attn_out = self.attn(
+                norm(x), ve, sa_lambdas, block_mask, cos, sin, attn_scale, docs, key_offset
+            )
+            x = x + attn_out
+
+        # MLP branch — variants with internal norms skip the external norm()
+        mlp_input = norm(x) if getattr(self.mlp, "needs_external_norm", True) else x
+        mlp_out = self.mlp(mlp_input)
+        x = x + mlp_out
+        return x - residual
+
+    def forward(
+        self,
+        x: Tensor,
+        ve: Tensor,
+        sa_lambdas: Tensor,
+        block_mask,
+        cos: Tensor,
+        sin: Tensor,
+        attn_scale: float,
+        docs: Tensor,
+        key_offset: bool = False,
+    ):
+        if self.residual_connection is not None:
+            return self.residual_connection(
+                x, ve, sa_lambdas, block_mask, cos, sin, attn_scale, docs, key_offset
+            )
+
+        return self._forward_standard(
+            x, ve, sa_lambdas, block_mask, cos, sin, attn_scale, docs, key_offset
+        )
+
 
 class GPT(nn.Module):
     def __init__(
@@ -532,6 +1100,7 @@ class GPT(nn.Module):
         rope_config: dict = None,
         embed_config: dict = None,
         low_rank_config: dict = None,
+        residual_connection_config: dict = None,
         wd_multipliers: dict = None,
     ):
         super().__init__()
@@ -730,6 +1299,71 @@ class GPT(nn.Module):
         self._logits_softcap_divisor = logits_softcap_divisor
         self._model_wd_multipliers = wd_multipliers
 
+        residual_connection_config = residual_connection_config or {}
+        residual_connection_mode = residual_connection_config.get("mode", "standard").lower()
+        if residual_connection_config.get("disable", False):
+            residual_connection_mode = "standard"
+        if residual_connection_mode == "residual":
+            residual_connection_mode = "standard"
+        if residual_connection_mode not in {"standard", "hc", "mhc"}:
+            raise ValueError(
+                f"Unsupported residual_connection.mode={residual_connection_mode!r}. "
+                "Expected one of: standard, hc, mhc."
+            )
+        self._residual_connection_mode = residual_connection_mode
+        self._residual_connection_expand = nn.Identity()
+        self._residual_connection_reduce = nn.Identity()
+        self._residual_connection_init = None
+
+        if residual_connection_mode != "standard":
+            residual_num_streams = int(residual_connection_config.get("num_streams", 4))
+            residual_num_fracs = int(residual_connection_config.get("num_fracs", 1))
+            if residual_num_streams < 1:
+                raise ValueError("residual_connection.num_streams must be >= 1")
+            if residual_num_fracs < 1:
+                raise ValueError("residual_connection.num_fracs must be >= 1")
+            if residual_connection_mode == "mhc" and residual_num_fracs != 1:
+                raise ValueError("residual_connection.num_fracs must be 1 when mode='mhc'")
+
+            residual_kwargs = dict(
+                tanh=residual_connection_config.get("tanh", True),
+                num_fracs=residual_num_fracs,
+                mhc=residual_connection_mode == "mhc",
+                sinkhorn_iters=residual_connection_config.get("sinkhorn_iters", 10),
+                sinkhorn_tau=residual_connection_config.get("sinkhorn_tau", 0.05),
+                mhc_h_res_proj=residual_connection_config.get("mhc_h_res_proj", "sinkhorn"),
+                ns_steps=residual_connection_config.get("ns_steps", 5),
+                ns_eps=residual_connection_config.get("ns_eps", 1e-7),
+                ns_coeffs=tuple(residual_connection_config.get("ns_coeffs", (3.0, -3.2, 1.2))),
+                mhc_residual_identity_mix=residual_connection_config.get(
+                    "mhc_residual_identity_mix", False
+                ),
+                mhc_residual_alpha=residual_connection_config.get(
+                    "mhc_residual_alpha", 0.01
+                ),
+            )
+
+            residual_disable = residual_connection_config.get("disable", None)
+            init_residual_connection, self._residual_connection_expand, self._residual_connection_reduce = (  # noqa: E501
+                get_init_and_expand_reduce_stream_functions(
+                    residual_num_streams,
+                    num_fracs=residual_num_fracs,
+                    disable=residual_disable,
+                )
+            )
+            self._residual_connection_init = partial(
+                init_residual_connection,
+                dim=model_dim,
+                **residual_kwargs,
+            )
+
+        if self._residual_connection_init is not None:
+            for i, block in enumerate(self.blocks):
+                block.residual_connection = self._residual_connection_init(
+                    branch=block._forward_delta,
+                    layer_index=i,
+                )
+
     def create_embed(self):
         """Create separate embedding when weight tying is split"""
         if self.embed is None and self._weight_tied_embeddings and self._enable_embed_split:
@@ -866,6 +1500,8 @@ class GPT(nn.Module):
             x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
 
         x = x0 = norm(x[None])
+        x = self._residual_connection_expand(x)
+        x0 = self._residual_connection_expand(x0)
 
         # Extract lambdas from scalars
         resid_lambdas = self.scalars[: self.num_layers]
@@ -918,6 +1554,7 @@ class GPT(nn.Module):
         if x_backout is not None:
             x = x - backout_lambda * x_backout
 
+        x = self._residual_connection_reduce(x)
         x = norm(x)
         logits = self.lm_head(x)
 

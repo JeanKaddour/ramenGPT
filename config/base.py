@@ -47,6 +47,22 @@ skip_config = dict(
     backout_layer=5,
 )
 
+residual_connection_config = dict(
+    mode="standard",
+    num_streams=1,
+    num_fracs=1,
+    tanh=True,
+    disable=None,
+    sinkhorn_iters=10,
+    sinkhorn_tau=0.05,
+    mhc_h_res_proj="sinkhorn",
+    ns_steps=5,
+    ns_eps=1e-7,
+    ns_coeffs=(3.0, -3.2, 1.2),
+    mhc_residual_identity_mix=False,
+    mhc_residual_alpha=0.01,
+)
+
 # Data layout matches the FineWeb shards used by baseline configs.
 TRAIN_SEQ_LEN = 512
 BATCH_SIZE_MULTIPLE = int(os.environ.get("BATCH_SIZE_MULTIPLE", "64"))
