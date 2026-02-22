@@ -206,6 +206,77 @@ def get_init_and_expand_reduce_stream_functions(
     return (init_hyper_conn_fn, *expand_reduce_fns)
 
 
+def build_residual_connection_fns(residual_connection_config: dict, model_dim: int):
+    """Resolve residual mode and return residual helper fns and initializer."""
+    residual_connection_config = residual_connection_config or {}
+    residual_connection_mode = residual_connection_config.get("mode", "standard").lower()
+    if residual_connection_config.get("disable", False):
+        residual_connection_mode = "standard"
+    if residual_connection_mode == "residual":
+        residual_connection_mode = "standard"
+    if residual_connection_mode not in {"standard", "hc", "mhc"}:
+        raise ValueError(
+            f"Unsupported residual_connection.mode={residual_connection_mode!r}. "
+            "Expected one of: standard, hc, mhc."
+        )
+
+    if residual_connection_mode == "standard":
+        return (
+            residual_connection_mode,
+            nn.Identity(),
+            nn.Identity(),
+            None,
+        )
+
+    residual_num_streams = int(residual_connection_config.get("num_streams", 4))
+    residual_num_fracs = int(residual_connection_config.get("num_fracs", 1))
+    if residual_num_streams < 1:
+        raise ValueError("residual_connection.num_streams must be >= 1")
+    if residual_num_fracs < 1:
+        raise ValueError("residual_connection.num_fracs must be >= 1")
+    if residual_connection_mode == "mhc" and residual_num_fracs != 1:
+        raise ValueError("residual_connection.num_fracs must be 1 when mode='mhc'")
+
+    residual_kwargs = dict(
+        tanh=residual_connection_config.get("tanh", True),
+        num_fracs=residual_num_fracs,
+        mhc=residual_connection_mode == "mhc",
+        sinkhorn_iters=residual_connection_config.get("sinkhorn_iters", 10),
+        sinkhorn_tau=residual_connection_config.get("sinkhorn_tau", 0.05),
+        mhc_h_res_proj=residual_connection_config.get("mhc_h_res_proj", "sinkhorn"),
+        ns_steps=residual_connection_config.get("ns_steps", 5),
+        ns_eps=residual_connection_config.get("ns_eps", 1e-7),
+        ns_coeffs=tuple(residual_connection_config.get("ns_coeffs", (3.0, -3.2, 1.2))),
+        mhc_residual_identity_mix=residual_connection_config.get(
+            "mhc_residual_identity_mix", False
+        ),
+        mhc_residual_alpha=residual_connection_config.get(
+            "mhc_residual_alpha", 0.01
+        ),
+    )
+
+    residual_disable = residual_connection_config.get("disable", None)
+    init_residual_connection, residual_expand, residual_reduce = (
+        get_init_and_expand_reduce_stream_functions(
+            residual_num_streams,
+            num_fracs=residual_num_fracs,
+            disable=residual_disable,
+        )
+    )
+    init_residual_connection = partial(
+        init_residual_connection,
+        dim=model_dim,
+        **residual_kwargs,
+    )
+
+    return (
+        residual_connection_mode,
+        residual_expand,
+        residual_reduce,
+        init_residual_connection,
+    )
+
+
 # norms
 
 
@@ -1299,63 +1370,15 @@ class GPT(nn.Module):
         self._logits_softcap_divisor = logits_softcap_divisor
         self._model_wd_multipliers = wd_multipliers
 
-        residual_connection_config = residual_connection_config or {}
-        residual_connection_mode = residual_connection_config.get("mode", "standard").lower()
-        if residual_connection_config.get("disable", False):
-            residual_connection_mode = "standard"
-        if residual_connection_mode == "residual":
-            residual_connection_mode = "standard"
-        if residual_connection_mode not in {"standard", "hc", "mhc"}:
-            raise ValueError(
-                f"Unsupported residual_connection.mode={residual_connection_mode!r}. "
-                "Expected one of: standard, hc, mhc."
-            )
-        self._residual_connection_mode = residual_connection_mode
-        self._residual_connection_expand = nn.Identity()
-        self._residual_connection_reduce = nn.Identity()
-        self._residual_connection_init = None
-
-        if residual_connection_mode != "standard":
-            residual_num_streams = int(residual_connection_config.get("num_streams", 4))
-            residual_num_fracs = int(residual_connection_config.get("num_fracs", 1))
-            if residual_num_streams < 1:
-                raise ValueError("residual_connection.num_streams must be >= 1")
-            if residual_num_fracs < 1:
-                raise ValueError("residual_connection.num_fracs must be >= 1")
-            if residual_connection_mode == "mhc" and residual_num_fracs != 1:
-                raise ValueError("residual_connection.num_fracs must be 1 when mode='mhc'")
-
-            residual_kwargs = dict(
-                tanh=residual_connection_config.get("tanh", True),
-                num_fracs=residual_num_fracs,
-                mhc=residual_connection_mode == "mhc",
-                sinkhorn_iters=residual_connection_config.get("sinkhorn_iters", 10),
-                sinkhorn_tau=residual_connection_config.get("sinkhorn_tau", 0.05),
-                mhc_h_res_proj=residual_connection_config.get("mhc_h_res_proj", "sinkhorn"),
-                ns_steps=residual_connection_config.get("ns_steps", 5),
-                ns_eps=residual_connection_config.get("ns_eps", 1e-7),
-                ns_coeffs=tuple(residual_connection_config.get("ns_coeffs", (3.0, -3.2, 1.2))),
-                mhc_residual_identity_mix=residual_connection_config.get(
-                    "mhc_residual_identity_mix", False
-                ),
-                mhc_residual_alpha=residual_connection_config.get(
-                    "mhc_residual_alpha", 0.01
-                ),
-            )
-
-            residual_disable = residual_connection_config.get("disable", None)
-            init_residual_connection, self._residual_connection_expand, self._residual_connection_reduce = (  # noqa: E501
-                get_init_and_expand_reduce_stream_functions(
-                    residual_num_streams,
-                    num_fracs=residual_num_fracs,
-                    disable=residual_disable,
-                )
-            )
-            self._residual_connection_init = partial(
-                init_residual_connection,
-                dim=model_dim,
-                **residual_kwargs,
-            )
+        (
+            self._residual_connection_mode,
+            self._residual_connection_expand,
+            self._residual_connection_reduce,
+            self._residual_connection_init,
+        ) = build_residual_connection_fns(
+            residual_connection_config,
+            model_dim,
+        )
 
         if self._residual_connection_init is not None:
             for i, block in enumerate(self.blocks):
