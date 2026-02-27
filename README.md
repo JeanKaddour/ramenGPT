@@ -24,7 +24,7 @@ uv run run.py
 | **LITE** — Muon with flat-direction dynamics enhancement | [arxiv.org/abs/2602.22681](https://arxiv.org/abs/2602.22681) |
 | **BAM** — Balanced Axis Momentum; replaces Newton-Schulz with Sinkhorn normalization | [github.com/knightron0/bam](https://github.com/knightron0/bam) |
 | **ARO-Sinkhorn** — adaptively rotated optimization with Sinkhorn normalization | [arxiv.org/abs/2602.09006](https://arxiv.org/abs/2602.09006) |
-| **Spectron** — optimizer for low-rank matrix factor pairs using polar express + power iteration | custom |
+| **Spectron** — optimizer for low-rank matrix factor pairs using polar express + power iteration | [arxiv.org/abs/2602.12429](https://arxiv.org/abs/2602.12429) |
 
 ### Architecture (`model.py`, `mlps.py`)
 
