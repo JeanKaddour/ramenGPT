@@ -15,6 +15,7 @@ dependencies = [
     "torch",
     "huggingface-hub",
     "kernels",
+    "einops",
     "setuptools",
     "wandb",
 ]
