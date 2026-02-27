@@ -1421,6 +1421,23 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             for group in optimizer2.param_groups:
                 group["momentum"] = momentum
 
+            # Beta scheduling for LITE optimizer
+            if matrix_optimizer_type == "lite":
+                lite_cfg = optimizer_config.get("lite", {})
+                beta_start = lite_cfg.get("beta_start", -0.25)
+                beta_end = lite_cfg.get("beta_end", 1.0)
+                beta_warmup_frac = lite_cfg.get("beta_warmup_frac", 0.50)
+                beta_warmup_steps = int(beta_warmup_frac * num_iterations)
+                if step < warmup_steps:
+                    beta = beta_start
+                elif step < warmup_steps + beta_warmup_steps:
+                    frac = (step - warmup_steps) / max(beta_warmup_steps, 1)
+                    beta = beta_start + frac * (beta_end - beta_start)
+                else:
+                    beta = beta_end
+                for group in optimizer2.param_groups:
+                    group["beta"] = beta
+
         # Step optimizers using TrainingManager (Adam + Muon + optional scalar optimizer)
         training_manager.step_optimizers(step)
 
@@ -1501,6 +1518,11 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                 "train_tokens_processed_abs": train_tokens_processed,
                 "train_tokens_this_step": train_tokens_this_step,
                 "tokens_per_sec": tokens_per_sec,
+                "lite_beta": (
+                    optimizer2.param_groups[0].get("beta")
+                    if optimizer2 is not None and matrix_optimizer_type == "lite"
+                    else None
+                ),
             }
 
             log_dict.update(grad_norm_dict)

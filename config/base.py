@@ -112,7 +112,7 @@ training_config = dict(
 
 optimizer_config = dict(
     use_muon=True,
-    matrix_optimizer="muon",  # "muon", "spectron", "aro", or "bam"
+    matrix_optimizer="muon",  # "muon", "spectron", "aro", "bam", or "lite"
     apply_lr_scale_to_weight_decay=False,
     adam=dict(
         lr=0.006,
@@ -167,6 +167,21 @@ optimizer_config = dict(
         nesterov=True,
         power_iter_steps=1,
         ns_iter_steps=5,
+    ),
+    lite=dict(
+        lr=0.02,
+        weight_decay=1.2,
+        momentum=0.95,
+        momentum_min=0.85,
+        momentum_warmup_frac=0.10,
+        momentum_cooldown_frac=0.10,
+        nesterov=True,
+        ns_steps=5,
+        subspace_ratio=0.1,
+        lr_ratio=2.0,
+        beta_start=-0.25,
+        beta_end=1.0,
+        beta_warmup_frac=0.50,
     ),
     lr_multipliers=dict(
         embed=1.0,

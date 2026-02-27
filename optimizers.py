@@ -135,6 +135,36 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
             print_fn(
                 f"Using ARO-Sinkhorn optimizer for {len(hidden_matrix_params)} matrix parameters"
             )
+        elif matrix_optimizer_type == "lite":
+            lite_cfg = optimizer_config.get(
+                "lite",
+                {
+                    "lr": 0.02,
+                    "momentum": 0.95,
+                    "momentum_min": 0.85,
+                    "momentum_warmup_frac": 0.10,
+                    "momentum_cooldown_frac": 0.10,
+                    "nesterov": True,
+                    "ns_steps": 5,
+                    "subspace_ratio": 0.1,
+                    "lr_ratio": 2.0,
+                    "beta_start": -0.25,
+                    "beta_end": 1.0,
+                    "beta_warmup_frac": 0.50,
+                },
+            )
+            matrix_opt = LITE(
+                hidden_matrix_params,
+                lr=lite_cfg["lr"],
+                momentum=lite_cfg["momentum"],
+                weight_decay=lite_cfg.get("weight_decay", 0.0),
+                nesterov=lite_cfg.get("nesterov", True),
+                ns_steps=lite_cfg.get("ns_steps", 5),
+                subspace_ratio=lite_cfg.get("subspace_ratio", 0.1),
+                lr_ratio=lite_cfg.get("lr_ratio", 2.0),
+                scale_weight_decay_by_lr=scale_weight_decay_by_lr,
+            )
+            print_fn(f"Using LITE optimizer for {len(hidden_matrix_params)} matrix parameters")
         elif matrix_optimizer_type == "bam":
             bam_cfg = optimizer_config.get(
                 "bam",
@@ -265,6 +295,12 @@ def polar_express(G: torch.Tensor, num_iters: int | None = None):
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
+
+
+@torch.no_grad()
+def mproj(M: torch.Tensor, sign_M: torch.Tensor, num_iters: int = 5) -> torch.Tensor:
+    """Top-subspace projection: keeps eigenvalue > 1 subspace of M."""
+    return (sign_M + polar_express(M - sign_M, num_iters=num_iters)) / 2
 
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -595,6 +631,130 @@ class NorMuon(torch.optim.Optimizer):
                 if eff_wd != 0:
                     p.addcmul_(p, mask, value=-eff_wd * eff_lr)
                 p.add_(g, alpha=-eff_lr)
+
+
+class LITE(torch.optim.Optimizer):
+    """
+    LITE — Muon with flat-direction dynamics enhancement.
+    arxiv.org/abs/2602.22681
+    """
+
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        momentum=0.95,
+        weight_decay=0.0,
+        nesterov=True,
+        ns_steps=5,
+        subspace_ratio=0.1,
+        lr_ratio=2.0,
+        beta=0.0,
+        scale_weight_decay_by_lr=False,
+    ):
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            subspace_ratio=subspace_ratio,
+            lr_ratio=lr_ratio,
+            beta=beta,
+            scale_weight_decay_by_lr=scale_weight_decay_by_lr,
+        )
+        super().__init__(params, defaults)
+
+    def reset(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].zero_()
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            ns_steps = group["ns_steps"]
+            lr_ratio = group["lr_ratio"]
+            beta = group["beta"]
+            subspace_ratio = group["subspace_ratio"]
+            scale_weight_decay_by_lr = group["scale_weight_decay_by_lr"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                g = p.grad
+                state = self.state[p]
+                m, n = p.size(-2), p.size(-1)
+
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                    state["subspace_threshold_ratio"] = 1.0 / (min(m, n) ** 0.5)
+                buf = state["momentum_buffer"]
+
+                # Clone gradient before Nesterov modifies it in-place
+                g_orig = g.clone()
+
+                # Momentum EMA
+                buf.lerp_(g, 1 - group["momentum"])
+                # Nesterov
+                M = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+
+                # Sign of momentum (orthogonalized)
+                m_ns = polar_express(M, num_iters=ns_steps)
+
+                # Subspace projection
+                k = int(subspace_ratio * min(m, n)) + 1
+                k = min(k, min(m, n) - 1)
+                thres_r = M.norm() * state["subspace_threshold_ratio"] + 1e-9
+                P = mproj(M / thres_r, m_ns, ns_steps)
+
+                # Adapt threshold
+                if P.norm() > k**0.5:
+                    state["subspace_threshold_ratio"] = min(
+                        1.0, state["subspace_threshold_ratio"] * 1.05
+                    )
+                else:
+                    state["subspace_threshold_ratio"] *= 0.95
+
+                # Flat projector: I_n - P^T @ P
+                P_flat = torch.eye(n, dtype=P.dtype, device=P.device) - P.mT @ P
+
+                # Hessian damping from original gradient
+                hd = polar_express(g_orig, num_iters=ns_steps)
+                hd_flat = hd @ P_flat
+
+                # Update: m_ns + beta * hd_flat, then amplify flat directions
+                update = m_ns + beta * hd_flat
+                update = update + (lr_ratio - 1) * (update @ P_flat)
+
+                # Effective LR with shape multiplier
+                shape_mult = max(1.0, m / n) ** 0.5
+                eff_lr = lr * shape_mult * getattr(p, "lr_mul", 1.0)
+
+                # Weight decay
+                wd_mul = getattr(p, "wd_mul", 1.0)
+                eff_wd = wd_mul * wd
+                if scale_weight_decay_by_lr:
+                    eff_wd *= lr
+
+                # Standard masked weight decay
+                update_p = update.to(dtype=p.dtype)
+                if eff_wd != 0:
+                    mask = (update_p * p) >= 0
+                    p.addcmul_(p, mask, value=-eff_wd * eff_lr)
+
+                # Extra flat-direction weight decay
+                if eff_wd != 0 and lr_ratio != 1.0:
+                    P_flat_p = P_flat.to(dtype=p.dtype)
+                    p.add_(p @ P_flat_p, alpha=-eff_lr * (lr_ratio - 1) * eff_wd)
+
+                # Apply update
+                p.add_(update_p, alpha=-eff_lr)
 
 
 @torch.compile(dynamic=False, fullgraph=True)
