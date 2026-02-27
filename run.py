@@ -72,6 +72,19 @@ def _parse_args():
         help="MLP variant to use (overrides config)",
     )
     parser.add_argument(
+        "--residual_connection_mode",
+        type=str,
+        default=None,
+        choices=["standard", "hc", "mhc", "residual"],
+        help="Residual connection mode to use (overrides config)",
+    )
+    parser.add_argument(
+        "--residual_connection_num_streams",
+        type=int,
+        default=None,
+        help="Residual stream count for hc/mhc modes (overrides config)",
+    )
+    parser.add_argument(
         "--checkpoint_every",
         type=int,
         default=None,
