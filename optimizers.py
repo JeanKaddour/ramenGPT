@@ -874,7 +874,7 @@ def shifted_cholesky_qr(A, eps=1e-7):
 class AROSinkhorn(torch.optim.Optimizer):
     """
     ARO-Sinkhorn optimizer -- Adaptively Rotated Optimization with Sinkhorn normalization.
-    https://arxiv.org/abs/2502.xxxxx
+    https://arxiv.org/abs/2602.09006
 
     Uses a learned rotation matrix per parameter to align gradients before
     applying Sinkhorn normalization, achieving better spectral conditioning
