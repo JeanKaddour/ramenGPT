@@ -1,7 +1,13 @@
 import os
+
+NUM_LAYERS = 8
+VALUE_EMBED_HEAD_INDICES = [1, 2]
+VALUE_EMBED_MID_LAYER_COUNT = 5
+VALUE_EMBED_TAIL_INDICES = [0, 1, 2]
+
 model_config = dict(
     vocab_size=50257,
-    num_layers=6,
+    num_layers=NUM_LAYERS,
     num_heads=4,
     model_dim=256,
     head_dim=64,
@@ -10,9 +16,9 @@ model_config = dict(
     lm_head_init_std=0.005,
     embed_padding_multiple=128,
     eos_token_id=50256,
-    value_embed_head_indices=[1, 2],
-    value_embed_mid_layer_count=5,
-    value_embed_tail_indices=[0, 1, 2],
+    value_embed_head_indices=VALUE_EMBED_HEAD_INDICES,
+    value_embed_mid_layer_count=VALUE_EMBED_MID_LAYER_COUNT,
+    value_embed_tail_indices=VALUE_EMBED_TAIL_INDICES,
     value_embed_gate_scale=2.0,
     skip_gate_scale=2.0,
     residual_first_layer_index=0,
@@ -43,8 +49,8 @@ embed_config = dict(
 
 skip_config = dict(
     skip_in_layers=[2],
-    skip_out_layers=[4],
-    backout_layer=5,
+    skip_out_layers=[NUM_LAYERS - 2],
+    backout_layer=NUM_LAYERS - 1,
 )
 
 residual_connection_config = dict(
@@ -103,11 +109,21 @@ training_config = dict(
     num_iterations=420,
     num_scheduled_iterations=320,
     cooldown_frac=0.40,
+    final_lr_ratio=0.1,
     val_loss_every=50,
     save_checkpoint=False,
     checkpoint_every=0,
     checkpoint_root="checkpoints",
     grad_clip_norm=1.0,
+)
+
+lr_scheduler_config = dict(
+    scheduler_type="linear",
+    warmup_steps=16,
+    use_linear_warmup=True,
+    cooldown_steps=int(training_config["num_iterations"] * training_config["cooldown_frac"]),
+    final_lr_ratio=training_config["final_lr_ratio"],
+    cosine_min_lr_ratio=0.1,
 )
 
 optimizer_config = dict(
@@ -143,6 +159,7 @@ optimizer_config = dict(
         momentum_min=0.85,
         momentum_warmup_frac=0.10,
         momentum_cooldown_frac=0.10,
+        beta2=0.0,
         nesterov=True,
         sinkhorn_iters=5,
     ),
@@ -223,8 +240,12 @@ attention_config = dict(
 )
 
 attention_pattern_config = dict(
-    block_mask_pattern="SSSSSS",
-    value_embed_layers=[0, 1, 2, 3, 4, 5],
+    block_mask_pattern="S" * NUM_LAYERS,
+    value_embed_layers=(
+        VALUE_EMBED_HEAD_INDICES
+        + [None] * (NUM_LAYERS - VALUE_EMBED_MID_LAYER_COUNT)
+        + VALUE_EMBED_TAIL_INDICES
+    ),
     num_value_embeds=3,
     skip_attention_layers=[],
 )

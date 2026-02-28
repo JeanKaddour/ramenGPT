@@ -520,6 +520,12 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     logging_config = config.logging_config
     compilation_config = getattr(config, "compilation_config", {"compile_model": False})
     lr_scheduler_config = getattr(config, "lr_scheduler_config", None)
+    if lr_scheduler_config is None:
+        raise ValueError(f"config missing required lr_scheduler_config in {args.config}")
+
+    if not all(key in lr_scheduler_config for key in ["scheduler_type", "warmup_steps", "use_linear_warmup", "cooldown_steps", "final_lr_ratio"]):
+        raise ValueError(f"config.lr_scheduler_config in {args.config} is missing required keys")
+
     train_micro_batch_tokens = data_config.get(
         "train_micro_batch_tokens", data_config["train_seq_len"]
     )
@@ -799,163 +805,94 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     print_log("=" * 100)
 
     # learning rate scheduler: supports multiple scheduler types
+    def get_batch_scale(step: int) -> float:
+        # Keep previous batch-size-aware LR scaling behavior.
+        if batch_schedule_config is None:
+            return 1.0
+        batch_sizes = batch_schedule_config.get("batch_sizes")
+        base_batch = int(training_manager.get_batch_size(0))
+        current_batch = int(training_manager.get_batch_size(step))
+        if (
+            not batch_sizes
+            or base_batch <= 0
+            or current_batch <= base_batch
+        ):
+            return 1.0
+        scale = current_batch / base_batch
+        exponent = 0.45 if scale < 2.0 else 0.4
+        return scale**exponent
+
     def get_lr(step: int):
         num_iterations = training_config["num_iterations"]
         if step > num_iterations:
-            return training_config.get("final_lr_ratio", 0.1)
+            return lr_scheduler_config.get("final_lr_ratio", 0.1)
 
-        # Use lr_scheduler_config if available, otherwise fall back to legacy config
-        if lr_scheduler_config is not None:
-            scheduler_type = lr_scheduler_config.get("scheduler_type", "linear")
-            warmup_steps = lr_scheduler_config.get("warmup_steps", 0)
-            use_linear_warmup = lr_scheduler_config.get("use_linear_warmup", True)
+        scheduler_type = lr_scheduler_config.get("scheduler_type", "linear")
+        warmup_steps = lr_scheduler_config.get("warmup_steps", 0)
+        use_linear_warmup = lr_scheduler_config.get("use_linear_warmup", True)
+        cooldown_steps = lr_scheduler_config.get("cooldown_steps")
+        if cooldown_steps is None:
+            cooldown_steps = int(num_iterations * training_config.get("cooldown_frac", 0.0))
 
-            # Determine cooldown steps
-            cooldown_steps = lr_scheduler_config.get("cooldown_steps")
-            if cooldown_steps is None:
-                cooldown_frac = training_config.get("cooldown_frac", 0.0)
-                cooldown_steps = int(num_iterations * cooldown_frac)
+        main_steps = num_iterations - warmup_steps - cooldown_steps
+        batch_scale = get_batch_scale(step)
 
-            # Main training steps (excluding warmup and cooldown)
-            main_steps = num_iterations - warmup_steps - cooldown_steps
+        if step < warmup_steps and warmup_steps > 0:
+            if use_linear_warmup:
+                return step / warmup_steps
+            return 0.5 * (1 + math.cos(math.pi * (1 - step / warmup_steps)))
 
-            # Initialize lr_multiplier
-            lr_multiplier = 1.0
+        adjusted_step = step - warmup_steps
 
-            # Handle warmup phase
-            if step < warmup_steps and warmup_steps > 0:
-                if use_linear_warmup:
-                    # Linear warmup
-                    lr_multiplier = step / warmup_steps
-                else:
-                    # Cosine warmup
-                    lr_multiplier = 0.5 * (1 + math.cos(math.pi * (1 - step / warmup_steps)))
-                return lr_multiplier
+        if adjusted_step < main_steps:
+            progress = adjusted_step / main_steps if main_steps > 0 else 1.0
+            if scheduler_type == "cosine":
+                min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
+                lr_multiplier = min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (
+                    1 + math.cos(math.pi * progress)
+                )
+            elif scheduler_type == "cosine_with_restarts":
+                num_cycles = lr_scheduler_config.get("cosine_restart_cycles", 1)
+                decay_factor = lr_scheduler_config.get("cosine_restart_decay", 1.0)
+                min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
+                cycle_length = main_steps / num_cycles
+                cycle = int(adjusted_step / cycle_length)
+                cycle_progress = (adjusted_step % cycle_length) / cycle_length
+                cycle_max = decay_factor**cycle
+                cycle_min = min_lr_ratio * cycle_max
+                lr_multiplier = cycle_min + (cycle_max - cycle_min) * 0.5 * (
+                    1 + math.cos(math.pi * cycle_progress)
+                )
+            elif scheduler_type == "exponential":
+                gamma = lr_scheduler_config.get("exponential_gamma", 0.95)
+                lr_multiplier = gamma**adjusted_step
+            elif scheduler_type == "linear":
+                lr_multiplier = 1.0
+            else:
+                lr_multiplier = 1.0
+            return batch_scale * lr_multiplier
 
-            # Adjust step for main phase (after warmup)
-            adjusted_step = step - warmup_steps
-
-            # Handle main training phase
-            if adjusted_step < main_steps:
-                progress = adjusted_step / main_steps if main_steps > 0 else 1.0
-
+        if cooldown_steps > 0:
+            cooldown_progress = (adjusted_step - main_steps) / cooldown_steps
+            final_lr_ratio = lr_scheduler_config.get("final_lr_ratio", 0.1)
+            if scheduler_type == "cosine" or scheduler_type == "cosine_with_restarts":
+                min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
                 if scheduler_type == "cosine":
-                    # Cosine annealing
-                    min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
-                    lr_multiplier = min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (
-                        1 + math.cos(math.pi * progress)
-                    )
-
-                elif scheduler_type == "cosine_with_restarts":
-                    # Cosine annealing with warm restarts
+                    main_end_lr = min_lr_ratio
+                else:
                     num_cycles = lr_scheduler_config.get("cosine_restart_cycles", 1)
                     decay_factor = lr_scheduler_config.get("cosine_restart_decay", 1.0)
-                    min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
-
-                    # Determine which cycle we're in
-                    cycle_length = main_steps / num_cycles
-                    cycle = int(adjusted_step / cycle_length)
-                    cycle_progress = (adjusted_step % cycle_length) / cycle_length
-
-                    # Apply decay to max LR for this cycle
-                    cycle_max = decay_factor**cycle
-                    cycle_min = min_lr_ratio * cycle_max
-
-                    # Cosine annealing within the cycle
-                    lr_multiplier = cycle_min + (cycle_max - cycle_min) * 0.5 * (
-                        1 + math.cos(math.pi * cycle_progress)
-                    )
-
-                elif scheduler_type == "exponential":
-                    # Exponential decay
-                    gamma = lr_scheduler_config.get("exponential_gamma", 0.95)
-                    lr_multiplier = gamma**adjusted_step
-
-                elif scheduler_type == "linear":
-                    # Linear decay (stable phase)
-                    lr_multiplier = 1.0
-
-                else:
-                    # Default to no decay
-                    lr_multiplier = 1.0
-
-            # Handle cooldown phase
-            elif cooldown_steps > 0:
-                cooldown_progress = (adjusted_step - main_steps) / cooldown_steps
-                final_lr_ratio = lr_scheduler_config.get("final_lr_ratio", 0.1)
-
-                if scheduler_type == "cosine" or scheduler_type == "cosine_with_restarts":
-                    # Continue cosine decay in cooldown
-                    min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
-                    # Get the LR at the end of main phase
-                    if scheduler_type == "cosine":
-                        main_end_lr = min_lr_ratio
-                    else:
-                        # For restarts, use the final cycle's minimum
-                        num_cycles = lr_scheduler_config.get("cosine_restart_cycles", 1)
-                        decay_factor = lr_scheduler_config.get("cosine_restart_decay", 1.0)
-                        main_end_lr = min_lr_ratio * (decay_factor ** (num_cycles - 1))
-
-                    # Linear decay from main_end_lr to final_lr_ratio during cooldown
-                    lr_multiplier = (
-                        main_end_lr * (1 - cooldown_progress) + final_lr_ratio * cooldown_progress
-                    )
-
-                else:
-                    # Linear cooldown for other schedulers
-                    lr_multiplier = (
-                        1 - cooldown_progress
-                    ) * 1.0 + cooldown_progress * final_lr_ratio
+                    main_end_lr = min_lr_ratio * (decay_factor ** (num_cycles - 1))
+                lr_multiplier = (
+                    main_end_lr * (1 - cooldown_progress) + final_lr_ratio * cooldown_progress
+                )
             else:
-                # Beyond training steps
-                lr_multiplier = lr_scheduler_config.get("final_lr_ratio", 0.1)
+                lr_multiplier = (
+                    1 - cooldown_progress
+                ) * 1.0 + cooldown_progress * final_lr_ratio
+            return batch_scale * lr_multiplier
 
-            return lr_multiplier
-
-        else:
-            # Legacy behavior: use warmup_config
-            # Match train_gpt.py intent: increase LR when batch size increases
-            lr_max = 1.0
-            x = step / num_iterations  # progress in training
-
-            # Batch size schedule scaling (config-driven, not hardcoded thirds).
-            if batch_schedule_config is not None:
-                batch_sizes = batch_schedule_config.get("batch_sizes")
-                transitions = batch_schedule_config.get("transitions")
-                if batch_sizes and len(batch_sizes) > 0:
-                    current_idx = 0
-                    if transitions:
-                        for i, trans in enumerate(transitions):
-                            if x >= trans:
-                                current_idx = min(i + 1, len(batch_sizes) - 1)
-                    base_batch = batch_sizes[0]
-                    current_batch = batch_sizes[current_idx]
-                    if base_batch > 0 and current_batch > base_batch:
-                        scale = current_batch / base_batch
-                        # Keep LR increases softer for tiny runs to avoid sharp loss jitter.
-                        exponent = 0.45 if scale < 2.0 else 0.4
-                        lr_max = scale**exponent
-            else:
-                # Fallback to previous default when no batch schedule exists.
-                if x > 1 / 3:
-                    lr_max = 1.52  # (16/8)**0.6
-                if x > 2 / 3:
-                    lr_max = 1.73  # (24/8)**0.5
-
-            lr_warmup_steps = warmup_config.get("lr_warmup_steps", 0)
-
-            # Learning rate warmup phase
-            if lr_warmup_steps > 0 and step < lr_warmup_steps:
-                # Linear warmup from 0 to 1
-                return step / lr_warmup_steps
-            # Stable phase
-            elif x < 1 - training_config["cooldown_frac"]:
-                return lr_max
-            # Cooldown phase
-            else:
-                w = (1 - x) / training_config["cooldown_frac"]
-                final_lr_ratio = training_config.get("final_lr_ratio", 0.1)
-                return lr_max * w + (1 - w) * final_lr_ratio
+        return lr_scheduler_config.get("final_lr_ratio", 0.1)
 
     # attention window size schedule (only for GPT)
     if model_type == "gpt":
@@ -1126,63 +1063,48 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     )
 
     # Log learning rate scheduler information
-    if lr_scheduler_config is not None:
-        scheduler_type = lr_scheduler_config.get("scheduler_type", "linear")
-        warmup_steps = lr_scheduler_config.get("warmup_steps", 0)
-        cooldown_steps = lr_scheduler_config.get("cooldown_steps")
-        if cooldown_steps is None:
-            cooldown_frac = training_config.get("cooldown_frac", 0.0)
-            cooldown_steps = int(train_steps * cooldown_frac)
-        main_steps = train_steps - warmup_steps - cooldown_steps
+    scheduler_type = lr_scheduler_config.get("scheduler_type", "linear")
+    warmup_steps = lr_scheduler_config.get("warmup_steps", 0)
+    cooldown_steps = lr_scheduler_config.get("cooldown_steps")
+    if cooldown_steps is None:
+        cooldown_steps = int(train_steps * training_config.get("cooldown_frac", 0.0))
+    main_steps = train_steps - warmup_steps - cooldown_steps
 
-        print_log(f"Learning rate scheduler: {scheduler_type}")
+    print_log(f"Learning rate scheduler: {scheduler_type}")
 
-        if scheduler_type == "cosine":
-            min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
-            print_log(f"  - Cosine annealing with min LR ratio: {min_lr_ratio}")
-        elif scheduler_type == "cosine_with_restarts":
-            num_cycles = lr_scheduler_config.get("cosine_restart_cycles", 1)
-            decay_factor = lr_scheduler_config.get("cosine_restart_decay", 1.0)
-            min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
-            print_log(f"  - Cosine with {num_cycles} restart cycle(s)")
-            print_log(f"  - Restart decay factor: {decay_factor}, min LR ratio: {min_lr_ratio}")
-        elif scheduler_type == "exponential":
-            gamma = lr_scheduler_config.get("exponential_gamma", 0.95)
-            print_log(f"  - Exponential decay with gamma: {gamma}")
+    if scheduler_type == "cosine":
+        min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
+        print_log(f"  - Cosine annealing with min LR ratio: {min_lr_ratio}")
+    elif scheduler_type == "cosine_with_restarts":
+        num_cycles = lr_scheduler_config.get("cosine_restart_cycles", 1)
+        decay_factor = lr_scheduler_config.get("cosine_restart_decay", 1.0)
+        min_lr_ratio = lr_scheduler_config.get("cosine_min_lr_ratio", 0.1)
+        print_log(f"  - Cosine with {num_cycles} restart cycle(s)")
+        print_log(f"  - Restart decay factor: {decay_factor}, min LR ratio: {min_lr_ratio}")
+    elif scheduler_type == "exponential":
+        gamma = lr_scheduler_config.get("exponential_gamma", 0.95)
+        print_log(f"  - Exponential decay with gamma: {gamma}")
 
-        if warmup_steps > 0:
-            use_linear_warmup = lr_scheduler_config.get("use_linear_warmup", True)
-            warmup_type = "linear" if use_linear_warmup else "cosine"
-            print_log(f"  - Warmup: {warmup_steps} steps ({warmup_type})")
-
-        print_log(f"  - Main phase: {main_steps} steps")
-
-        if cooldown_steps > 0:
-            final_lr_ratio = lr_scheduler_config.get("final_lr_ratio", 0.1)
-            print_log(f"  - Cooldown: {cooldown_steps} steps (final LR ratio: {final_lr_ratio})")
-
-        # Log phase boundaries
-        if warmup_steps > 0 or cooldown_steps > 0:
-            phases = []
-            if warmup_steps > 0:
-                phases.append(f"Warmup: 0-{warmup_steps-1}")
-            phases.append(f"Main: {warmup_steps}-{warmup_steps+main_steps-1}")
-            if cooldown_steps > 0:
-                phases.append(f"Cooldown: {warmup_steps+main_steps}-{train_steps-1}")
-            print_log(f"  - Phase boundaries: {', '.join(phases)}")
+    if warmup_steps > 0:
+        use_linear_warmup = lr_scheduler_config.get("use_linear_warmup", True)
+        warmup_type = "linear" if use_linear_warmup else "cosine"
+        print_log(f"  - Warmup: {warmup_steps} steps ({warmup_type})")
     else:
-        # Legacy behavior
-        lr_warmup_steps = warmup_config.get("lr_warmup_steps", 0)
-        if lr_warmup_steps > 0:
-            print_log(
-                f"Learning rate warmup: enabled for {lr_warmup_steps} steps (linearly increasing from 0 to 1)"
-            )
-            cooldown_start = int(train_steps * (1 - training_config["cooldown_frac"]))
-            print_log(f"  - Warmup phase: steps 0-{lr_warmup_steps-1}")
-            print_log(f"  - Stable phase: steps {lr_warmup_steps}-{cooldown_start-1}")
-            print_log(f"  - Cooldown phase: steps {cooldown_start}-{train_steps}")
-        else:
-            print_log("Learning rate warmup: disabled")
+        print_log("Learning rate warmup: disabled")
+
+    print_log(f"  - Main phase: {main_steps} steps")
+
+    if cooldown_steps > 0:
+        final_lr_ratio = lr_scheduler_config.get("final_lr_ratio", 0.1)
+        print_log(f"  - Cooldown: {cooldown_steps} steps (final LR ratio: {final_lr_ratio})")
+
+    phases = []
+    if warmup_steps > 0:
+        phases.append(f"Warmup: 0-{warmup_steps-1}")
+    phases.append(f"Main: {warmup_steps}-{warmup_steps+main_steps-1}")
+    if cooldown_steps > 0:
+        phases.append(f"Cooldown: {warmup_steps+main_steps}-{train_steps-1}")
+    print_log(f"  - Phase boundaries: {', '.join(phases)}")
 
     # Prepare checkpoint directory.
     # Periodic checkpoints write under output_dir/checkpoints/<timestamp>.
@@ -1471,12 +1393,8 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         lr_mult = get_lr(step)
 
         # Determine if we should show lr_mult in logging
-        if lr_scheduler_config is not None:
-            warmup_steps = lr_scheduler_config.get("warmup_steps", 0)
-            show_lr_info = warmup_steps > 0 and step < warmup_steps
-        else:
-            warmup_steps = warmup_config.get("lr_warmup_steps", 0)
-            show_lr_info = warmup_steps > 0 and step < warmup_steps
+        warmup_steps = lr_scheduler_config.get("warmup_steps", 0)
+        show_lr_info = warmup_steps > 0 and step < warmup_steps
 
         lr_info = f" lr_mult:{lr_mult:.3f}" if show_lr_info else ""
         print_log(
