@@ -130,6 +130,7 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                 weight_decay=aro_cfg.get("weight_decay", 0.0),
                 nesterov=aro_cfg.get("nesterov", True),
                 sinkhorn_iters=aro_cfg.get("sinkhorn_iters", 5),
+                rms_norm_target=aro_cfg.get("rms_norm_target", 0.0),
                 scale_weight_decay_by_lr=scale_weight_decay_by_lr,
             )
             print_fn(
@@ -862,7 +863,7 @@ def shifted_cholesky_qr(A, eps=1e-7):
     P = A.mT @ A + eps * torch.eye(m, device=A.device, dtype=A.dtype)
     try:
         L = torch.linalg.cholesky(P)
-        Q = torch.linalg.solve_triangular(L.mT, A.mT, upper=True).mT
+        Q = torch.linalg.solve_triangular(L, A.mT, upper=False).mT
         if not Q.isfinite().all():
             raise RuntimeError("Non-finite in SCQR")
         return Q
@@ -889,6 +890,7 @@ class AROSinkhorn(torch.optim.Optimizer):
         weight_decay=0.0,
         nesterov=True,
         sinkhorn_iters=5,
+        rms_norm_target=0.0,
         scale_weight_decay_by_lr=False,
     ):
         defaults = dict(
@@ -897,6 +899,7 @@ class AROSinkhorn(torch.optim.Optimizer):
             weight_decay=weight_decay,
             nesterov=nesterov,
             sinkhorn_iters=sinkhorn_iters,
+            rms_norm_target=rms_norm_target,
             scale_weight_decay_by_lr=scale_weight_decay_by_lr,
         )
         super().__init__(params, defaults)
@@ -912,12 +915,23 @@ class AROSinkhorn(torch.optim.Optimizer):
                         torch.eye(p.size(-2), device=p.device, dtype=torch.float32)
                     )
 
+    def reset_rotation(self):
+        """Reset rotation matrices to identity, preserving momentum buffers."""
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if "rotation" in state:
+                    state["rotation"].copy_(
+                        torch.eye(p.size(-2), device=p.device, dtype=torch.float32)
+                    )
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
             lr = group["lr"]
             wd = group["weight_decay"]
             sinkhorn_iters = group["sinkhorn_iters"]
+            rms_norm_target = group["rms_norm_target"]
             scale_weight_decay_by_lr = group["scale_weight_decay_by_lr"]
 
             for p in group["params"]:
@@ -953,6 +967,13 @@ class AROSinkhorn(torch.optim.Optimizer):
                 # --- Rotated update (second Sinkhorn call) ---
                 update = sinkhorn_normalize(R_new.mT @ M_float, num_iters=sinkhorn_iters)
                 delta = R_new @ update  # rotate back to original coords
+
+                # RMS clipping (inspired by ARO paper Section 4.4)
+                # Cap update at target RMS but don't amplify small updates
+                if rms_norm_target > 0:
+                    rms = delta.norm() / (delta.numel() ** 0.5)
+                    scale = min(rms_norm_target / rms.clamp_min(1e-8), 1.0)
+                    delta = delta * scale
 
                 # Apply shape multiplier, lr_mul, masked weight decay (same as NorMuon)
                 shape_mult = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
