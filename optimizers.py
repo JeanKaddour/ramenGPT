@@ -127,10 +127,12 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                 hidden_matrix_params,
                 lr=aro_cfg["lr"],
                 momentum=aro_cfg["momentum"],
+                beta2=aro_cfg.get("beta2", 0.0),
                 weight_decay=aro_cfg.get("weight_decay", 0.0),
                 nesterov=aro_cfg.get("nesterov", True),
                 sinkhorn_iters=aro_cfg.get("sinkhorn_iters", 5),
                 rms_norm_target=aro_cfg.get("rms_norm_target", 0.0),
+                transpose_aware=aro_cfg.get("transpose_aware", False),
                 scale_weight_decay_by_lr=scale_weight_decay_by_lr,
             )
             print_fn(
@@ -887,19 +889,23 @@ class AROSinkhorn(torch.optim.Optimizer):
         params,
         lr=0.02,
         momentum=0.95,
+        beta2=0.0,
         weight_decay=0.0,
         nesterov=True,
         sinkhorn_iters=5,
         rms_norm_target=0.0,
+        transpose_aware=False,
         scale_weight_decay_by_lr=False,
     ):
         defaults = dict(
             lr=lr,
             momentum=momentum,
+            beta2=beta2,
             weight_decay=weight_decay,
             nesterov=nesterov,
             sinkhorn_iters=sinkhorn_iters,
             rms_norm_target=rms_norm_target,
+            transpose_aware=transpose_aware,
             scale_weight_decay_by_lr=scale_weight_decay_by_lr,
         )
         super().__init__(params, defaults)
@@ -911,9 +917,12 @@ class AROSinkhorn(torch.optim.Optimizer):
                 if "momentum_buffer" in state:
                     state["momentum_buffer"].zero_()
                 if "rotation" in state:
+                    n = state["rotation"].size(0)
                     state["rotation"].copy_(
-                        torch.eye(p.size(-2), device=p.device, dtype=torch.float32)
+                        torch.eye(n, device=p.device, dtype=torch.float32)
                     )
+                if "second_momentum_buffer" in state:
+                    state["second_momentum_buffer"].zero_()
 
     def reset_rotation(self):
         """Reset rotation matrices to identity, preserving momentum buffers."""
@@ -921,8 +930,9 @@ class AROSinkhorn(torch.optim.Optimizer):
             for p in group["params"]:
                 state = self.state[p]
                 if "rotation" in state:
+                    n = state["rotation"].size(0)
                     state["rotation"].copy_(
-                        torch.eye(p.size(-2), device=p.device, dtype=torch.float32)
+                        torch.eye(n, device=p.device, dtype=torch.float32)
                     )
 
     @torch.no_grad()
@@ -930,6 +940,7 @@ class AROSinkhorn(torch.optim.Optimizer):
         for group in self.param_groups:
             lr = group["lr"]
             wd = group["weight_decay"]
+            beta2 = group["beta2"]
             sinkhorn_iters = group["sinkhorn_iters"]
             rms_norm_target = group["rms_norm_target"]
             scale_weight_decay_by_lr = group["scale_weight_decay_by_lr"]
@@ -941,22 +952,31 @@ class AROSinkhorn(torch.optim.Optimizer):
                 g = p.grad
                 state = self.state[p]
 
-                # Initialize state on first step
+                # Initialize momentum buffer
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
-                if "rotation" not in state:
-                    state["rotation"] = torch.eye(
-                        p.size(-2), device=p.device, dtype=torch.float32
-                    )
 
                 buf = state["momentum_buffer"]
-                R = state["rotation"]
 
                 # Momentum EMA
                 buf.lerp_(g, 1 - group["momentum"])
                 M = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
 
                 M_float = M.float()
+
+                # Symmetry-aware orientation: transpose input-side params
+                transpose = group["transpose_aware"] and getattr(p, "aro_transpose", False)
+                if transpose:
+                    M_float = M_float.mT
+
+                # Initialize rotation with correct dimension
+                rot_dim = M_float.size(-2)
+                if "rotation" not in state:
+                    state["rotation"] = torch.eye(
+                        rot_dim, device=p.device, dtype=torch.float32
+                    )
+
+                R = state["rotation"]
 
                 # --- Rotation selection (first Sinkhorn call) ---
                 D_tilde = sinkhorn_normalize(R.mT @ M_float, num_iters=sinkhorn_iters)
@@ -967,6 +987,27 @@ class AROSinkhorn(torch.optim.Optimizer):
                 # --- Rotated update (second Sinkhorn call) ---
                 update = sinkhorn_normalize(R_new.mT @ M_float, num_iters=sinkhorn_iters)
                 delta = R_new @ update  # rotate back to original coords
+
+                # Transpose back to original parameter space
+                if transpose:
+                    delta = delta.mT
+
+                # Variance reduction (NorMuon-style second-moment estimator)
+                if beta2 > 0:
+                    is_gate = "gate" in getattr(p, "label", "")
+                    if is_gate or p.shape[-2] >= p.shape[-1]:
+                        red_dim = -1
+                        buffer_shape = (*delta.shape[:-1], 1)
+                    else:
+                        red_dim = -2
+                        buffer_shape = (*delta.shape[:-2], 1, delta.shape[-1])
+                    if "second_momentum_buffer" not in state:
+                        state["second_momentum_buffer"] = torch.zeros(
+                            buffer_shape, dtype=delta.dtype, device=delta.device
+                        )
+                    delta = apply_normuon_variance_reduction(
+                        delta, state["second_momentum_buffer"], beta2, red_dim
+                    )
 
                 # RMS clipping (inspired by ARO paper Section 4.4)
                 # Cap update at target RMS but don't amplify small updates

@@ -397,6 +397,10 @@ def _label_mlp_params(module: nn.Module, c_proj_lr_mul: float):
 
     For down-projection parameters (named ``*proj*``, ``*to_out*``, or
     ``*c_proj*``) also set `.lr_mul = c_proj_lr_mul`.
+
+    Sets `.aro_transpose` for ARO symmetry-aware orientation:
+    input-side params (c_fc, up, gate) get transposed; output-side
+    params (c_proj, down_proj, to_out) do not.
     """
     for name, p in module.named_parameters():
         if p.ndim >= 2:
@@ -404,6 +408,9 @@ def _label_mlp_params(module: nn.Module, c_proj_lr_mul: float):
             lname = name.lower()
             if "proj" in lname or "to_out" in lname or "c_proj" in lname:
                 p.lr_mul = c_proj_lr_mul
+            # ARO orientation: output-side (c_proj/down/to_out) = no transpose
+            is_output_side = "c_proj" in lname or "down" in lname or "to_out" in lname
+            p.aro_transpose = not is_output_side
 
 
 # ===========================================================================
@@ -470,8 +477,10 @@ class DefaultMLP(nn.Module):
             self.c_fc = nn.Parameter(torch.empty(c_fc_dim, dim))
             self.c_proj = nn.Parameter(torch.empty(ffn_dim, dim))
             self.c_fc.label = "mlp"
+            self.c_fc.aro_transpose = True  # input-side
             self.c_proj.label = "mlp"
             self.c_proj.lr_mul = c_proj_lr_mul
+            self.c_proj.aro_transpose = False  # output-side
         self.ffn_dim = ffn_dim
 
         std = std_scale * (dim**-0.5)

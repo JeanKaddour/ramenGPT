@@ -274,6 +274,17 @@ class TrainingManager:
                 f"(grad_accum_steps={resolved})"
             )
             self.scalar_freeze_countdown = self.freeze_steps
+            # Reset rotation matrices for ARO at batch size transitions
+            matrix_cfg = self.optimizer_config.get(
+                self.optimizer_config.get("matrix_optimizer", "muon"), {}
+            )
+            if (
+                matrix_cfg.get("reset_rotation_on_transition", False)
+                and self.muon_opt is not None
+                and hasattr(self.muon_opt, "reset_rotation")
+            ):
+                self.muon_opt.reset_rotation()
+                self.print_fn(f"Step {step}: Reset ARO rotation matrices")
 
         # Check for window size transitions
         old_ws = self.current_window_size
