@@ -35,6 +35,7 @@ uv run run.py
 | **Long-short sliding window attention** — alternating window sizes across layers | [Gemma 2](https://arxiv.org/abs/2408.00118) |
 | **Logit softcapping** — sigmoid-bounded output logits | [Gemma 2](https://arxiv.org/abs/2408.00118) |
 | **HyperConnections / mHC** — dynamic multi-stream residual routing with manifold constraints | [arxiv.org/abs/2409.19606](https://arxiv.org/abs/2409.19606) |
+| **KromHC** — Kronecker-product manifold-constrained hyper-connections with doubly stochastic factors | [arxiv.org/abs/2601.21579](https://arxiv.org/abs/2601.21579) |
 | **Normalized feedforward (nFF)** — L2-norm-based nGPT feedforward | [arxiv.org/abs/2410.01131](https://arxiv.org/abs/2410.01131) |
 | **Deep residual MLP** — periodic residuals (Wang et al.) | [arxiv.org/abs/2503.14858](https://arxiv.org/abs/2503.14858) |
 

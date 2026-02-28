@@ -75,7 +75,7 @@ def _parse_args():
         "--residual_connection_mode",
         type=str,
         default=None,
-        choices=["standard", "hc", "mhc", "residual"],
+        choices=["standard", "hc", "mhc", "kromhc", "residual"],
         help="Residual connection mode to use (overrides config)",
     )
     parser.add_argument(

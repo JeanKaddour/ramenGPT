@@ -1,3 +1,4 @@
+import itertools
 import math
 from functools import partial
 from random import randrange
@@ -153,6 +154,55 @@ def orthostochastic_project(logits, ns_steps=5, ns_eps=1e-7, ns_coeffs=(3.0, -3.
 
 
 # -------------------------------------------------------------------------
+# KromHC helpers (Kronecker-product doubly stochastic factor matrices)
+# Ref: https://arxiv.org/abs/2601.21579
+# -------------------------------------------------------------------------
+
+_kromhc_perm_mats_2x2: dict[str, torch.Tensor] = {}
+_kromhc_perm_mats_general: dict[tuple, torch.Tensor] = {}
+
+
+def get_2x2_perm_matrices(device="cpu"):
+    """Returns the two 2x2 permutation matrices: identity and swap. Shape: (2, 2, 2)."""
+    return torch.tensor(
+        [[[1.0, 0.0], [0.0, 1.0]], [[0.0, 1.0], [1.0, 0.0]]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def factorize_into_twos(n: int):
+    """Factorize *n* into a product of 2s. Only power-of-2 *n* is fully supported."""
+    if n == 1:
+        return []
+    factors = []
+    remaining = n
+    while remaining % 2 == 0:
+        factors.append(2)
+        remaining //= 2
+    if remaining > 1:
+        factors.append(remaining)
+    return factors
+
+
+def get_all_permutations(n: int):
+    """Generate all n! permutation matrices, returned as shape (n!, n, n)."""
+    assert n >= 1, "n must be a positive integer"
+    perms = list(itertools.permutations(range(n)))
+    index = torch.tensor(perms, dtype=torch.long, device="cpu")
+    eye = torch.eye(n, dtype=torch.float32, device="cpu")
+    return eye[index]
+
+
+def get_cached_2x2_perms(device):
+    """Get cached 2x2 permutation matrices for *device*."""
+    dev_key = str(device)
+    if dev_key not in _kromhc_perm_mats_2x2:
+        _kromhc_perm_mats_2x2[dev_key] = get_2x2_perm_matrices(device)
+    return _kromhc_perm_mats_2x2[dev_key]
+
+
+# -------------------------------------------------------------------------
 # Residual stream connections
 # Adapted from:
 # https://github.com/tokenbender/mHC-manifold-constrained-hyper-connections
@@ -214,10 +264,10 @@ def build_residual_connection_fns(residual_connection_config: dict, model_dim: i
         residual_connection_mode = "standard"
     if residual_connection_mode == "residual":
         residual_connection_mode = "standard"
-    if residual_connection_mode not in {"standard", "hc", "mhc"}:
+    if residual_connection_mode not in {"standard", "hc", "mhc", "kromhc"}:
         raise ValueError(
             f"Unsupported residual_connection.mode={residual_connection_mode!r}. "
-            "Expected one of: standard, hc, mhc."
+            "Expected one of: standard, hc, mhc, kromhc."
         )
 
     if residual_connection_mode == "standard":
@@ -234,6 +284,29 @@ def build_residual_connection_fns(residual_connection_config: dict, model_dim: i
         raise ValueError("residual_connection.num_streams must be >= 1")
     if residual_num_fracs < 1:
         raise ValueError("residual_connection.num_fracs must be >= 1")
+
+    if residual_connection_mode == "kromhc":
+        if residual_num_streams < 2 or (residual_num_streams & (residual_num_streams - 1)) != 0:
+            raise ValueError(
+                "residual_connection.num_streams must be a power of 2 and >= 2 "
+                f"for kromhc mode, got {residual_num_streams}"
+            )
+
+        residual_expand, residual_reduce = get_expand_reduce_stream_functions(
+            residual_num_streams
+        )
+        init_residual_connection = partial(
+            KromHC, residual_num_streams, num_fracs=residual_num_fracs
+        )
+        init_residual_connection = partial(init_residual_connection, dim=model_dim)
+
+        return (
+            residual_connection_mode,
+            residual_expand,
+            residual_reduce,
+            init_residual_connection,
+        )
+
     if residual_connection_mode == "mhc" and residual_num_fracs != 1:
         raise ValueError("residual_connection.num_fracs must be 1 when mode='mhc'")
 
@@ -620,6 +693,308 @@ HyperConnections.get_expand_reduce_stream_functions = staticmethod(
     get_expand_reduce_stream_functions
 )
 HyperConnections.get_init_and_expand_reduce_stream_functions = staticmethod(
+    get_init_and_expand_reduce_stream_functions
+)
+
+
+class KromHC(nn.Module):
+    """Kronecker Low-Rank Hyper-Connections (KromHC).
+
+    The H_res matrix is a Kronecker product of small (2x2) doubly stochastic
+    factor matrices, guaranteeing exact double stochasticity with O(n^2*C)
+    parameters.  Ref: https://arxiv.org/abs/2601.21579
+    """
+
+    def __init__(
+        self,
+        num_residual_streams,
+        *,
+        dim,
+        branch=None,
+        layer_index=None,
+        channel_first=False,
+        dropout=0.0,
+        residual_transform=None,
+        add_branch_out_to_residual=True,
+        num_input_views=1,
+        depth_residual_fn=add,
+        num_fracs=1,
+    ):
+        super().__init__()
+
+        self.branch = branch
+        assert num_fracs >= 1
+        self.num_fracs = num_fracs
+        self.has_fracs = num_fracs > 1
+
+        self.split_fracs = Rearrange("b ... (f d) -> b ... f d", f=num_fracs)
+        self.merge_fracs = Rearrange("b ... f d -> b ... (f d)")
+        assert divisible_by(dim, num_fracs), (
+            f"feature dimension ({dim}) must be divisible by `num_fracs` ({num_fracs})"
+        )
+
+        dim //= num_fracs
+
+        assert num_residual_streams >= 2, "`num_residual_streams` must be at least 2"
+        assert num_residual_streams & (num_residual_streams - 1) == 0, (
+            f"`num_residual_streams` must be a power of 2, got {num_residual_streams}"
+        )
+
+        self.num_residual_streams = num_residual_streams
+        init_residual_index = (
+            default(layer_index, randrange(num_residual_streams)) % num_residual_streams
+        )
+
+        num_residual_streams_fracs = num_residual_streams * num_fracs
+        num_input_views_fracs = num_input_views * num_fracs
+
+        # width-norm over flattened streams
+        self.norm = RMSNorm(dim * num_residual_streams_fracs)
+
+        assert num_input_views >= 1
+        self.num_input_views = num_input_views
+
+        # Factorize num_residual_streams into 2s for Kronecker structure
+        self.factors = factorize_into_twos(num_residual_streams)
+        self.num_factors = len(self.factors)
+
+        self.factor_perms: list[int] = []
+        total_res_coeffs = 0
+        for f in self.factors:
+            num_perms = math.factorial(f)
+            self.factor_perms.append(num_perms)
+            total_res_coeffs += num_perms
+
+        # Cache perm matrices for non-2 factors (future non-power-of-2 support)
+        for f in self.factors:
+            if f > 2 and (f, "cpu") not in _kromhc_perm_mats_general:
+                _kromhc_perm_mats_general[(f, "cpu")] = get_all_permutations(f).to("cpu")
+
+        # --- static alpha: pre-branch selector + Kronecker residual coefficients ---
+        init_alpha0 = torch.ones((num_residual_streams_fracs, num_input_views_fracs)) * -1
+        init_alpha0[init_residual_index, :] = 1.0
+
+        init_alpha1 = torch.ones(total_res_coeffs * num_fracs) * -8
+        coeff_idx = 0
+        for num_perms in self.factor_perms:
+            init_alpha1[coeff_idx] = 0.0  # identity perm of each factor
+            coeff_idx += num_perms
+
+        self.static_alpha = nn.Parameter(cat([init_alpha0.view(-1), init_alpha1], dim=-1))
+
+        self.dynamic_alpha_fn = nn.Parameter(
+            torch.zeros(
+                dim * num_residual_streams,
+                num_fracs * (total_res_coeffs + num_residual_streams * num_input_views),
+            )
+        )
+
+        self.pre_branch_scale = nn.Parameter(torch.ones(1) * 1e-2)
+        self.residual_scale = nn.Parameter(torch.ones(1) * 1e-2)
+
+        self.total_res_coeffs = total_res_coeffs
+
+        self.add_branch_out_to_residual = add_branch_out_to_residual
+
+        if add_branch_out_to_residual:
+            beta_init = torch.ones(num_residual_streams_fracs) * -1.0
+            beta_init[init_residual_index] = 1.0
+            self.static_beta = nn.Parameter(beta_init)
+
+            self.dynamic_beta_fn = nn.Parameter(
+                torch.zeros(dim * num_residual_streams, num_fracs * num_residual_streams)
+            )
+            self.h_post_scale = nn.Parameter(torch.ones(()) * 1e-2)
+
+        self.dropout = nn.Dropout(dropout)
+        self.channel_first = channel_first
+        self.residual_transform = default(residual_transform, nn.Identity())
+        self.depth_residual_fn = depth_residual_fn
+
+    # -- Kronecker H_res builder ------------------------------------------
+
+    def _get_factor_perms(self, factor_size, device):
+        if factor_size == 2:
+            return get_cached_2x2_perms(device)
+        dev_key = str(device)
+        if (factor_size, dev_key) not in _kromhc_perm_mats_general:
+            _kromhc_perm_mats_general[(factor_size, dev_key)] = (
+                get_all_permutations(factor_size).to(device)
+            )
+        return _kromhc_perm_mats_general[(factor_size, dev_key)]
+
+    def _build_kronecker_hres(self, dynamic_coeffs, static_coeffs, device):
+        """Build the H_res matrix via Kronecker product of learned 2x2 DS factors."""
+        if len(self.factors) == 0:
+            return dynamic_coeffs.new_ones(dynamic_coeffs.shape[:-1] + (1, 1))
+
+        combined_coeffs = self.residual_scale * dynamic_coeffs + static_coeffs
+
+        all_2x2 = all(f == 2 for f in self.factors)
+
+        if all_2x2:
+            batch_shape = combined_coeffs.shape[:-1]
+            coeffs_reshaped = combined_coeffs.view(*batch_shape, self.num_factors, 2)
+            weights = F.softmax(coeffs_reshaped, dim=-1)
+            p = weights[..., 0]
+
+            one_minus_p = 1.0 - p
+            row0 = torch.stack([p, one_minus_p], dim=-1)
+            row1 = torch.stack([one_minus_p, p], dim=-1)
+            all_factor_matrices = torch.stack([row0, row1], dim=-2)
+
+            result = all_factor_matrices[..., 0, :, :]
+            for k in range(1, self.num_factors):
+                mat = all_factor_matrices[..., k, :, :]
+                result_exp = result.unsqueeze(-1).unsqueeze(-3)
+                mat_exp = mat.unsqueeze(-4).unsqueeze(-2)
+                kron = result_exp * mat_exp
+                result = kron.reshape(
+                    *batch_shape, result.shape[-2] * 2, result.shape[-1] * 2
+                )
+            return result
+        else:
+            # Fallback for non-2x2 factors
+            factor_matrices = []
+            coeff_idx = 0
+            for factor_size, num_perms in zip(self.factors, self.factor_perms):
+                factor_coeffs = combined_coeffs[..., coeff_idx : coeff_idx + num_perms]
+                coeff_idx += num_perms
+                perms = self._get_factor_perms(factor_size, device)
+                w = F.softmax(factor_coeffs, dim=-1)
+                U_k = einsum(w, perms, "... r, r i j -> ... i j")
+                factor_matrices.append(U_k)
+
+            result = factor_matrices[0]
+            for mat in factor_matrices[1:]:
+                result_exp = rearrange(result, "... a1 a2 -> ... a1 1 a2 1")
+                mat_exp = rearrange(mat, "... b1 b2 -> ... 1 b1 1 b2")
+                kron = result_exp * mat_exp
+                result = rearrange(kron, "... a b c d -> ... (a b) (c d)")
+            return result
+
+    # -- width / depth / forward ------------------------------------------
+
+    def width_connection(self, residuals):
+        residual_dtype = residuals.dtype
+        streams = self.num_residual_streams
+
+        if self.channel_first:
+            residuals = rearrange(residuals, "b d ... -> b ... d")
+
+        residuals = self.split_fracs(residuals)
+        residuals = rearrange(residuals, "(b s) ... d -> b ... s d", s=streams)
+
+        # norm over flattened streams
+        normed = rearrange(residuals, "b ... s d -> b ... (s d)", s=streams)
+        normed = self.norm(normed)
+
+        if self.add_branch_out_to_residual:
+            fused_weights = cat([self.dynamic_alpha_fn, self.dynamic_beta_fn], dim=-1)
+        else:
+            fused_weights = self.dynamic_alpha_fn
+        combined_weight = normed @ fused_weights
+
+        alpha_size = self.dynamic_alpha_fn.shape[-1]
+        wc_weight = combined_weight[..., :alpha_size]
+
+        psize = self.num_input_views * streams
+        dynamic_pre, dynamic_residual = wc_weight[..., :psize], wc_weight[..., psize:]
+        static_pre, static_residual = self.static_alpha[:psize], self.static_alpha[psize:]
+
+        device = combined_weight.device
+
+        alpha_residual = self._build_kronecker_hres(dynamic_residual, static_residual, device)
+        alpha_residual = self.split_fracs(alpha_residual)
+
+        alpha_pre = self.pre_branch_scale * dynamic_pre + static_pre
+        alpha_pre = rearrange(
+            alpha_pre, "... (f s v) -> ... s f v", v=self.num_input_views, f=self.num_fracs
+        )
+        alpha_pre = alpha_pre.sigmoid()
+
+        alpha = cat((alpha_pre, alpha_residual), dim=-1).to(residual_dtype)
+
+        beta = None
+        if self.add_branch_out_to_residual:
+            dc_weight = combined_weight[..., alpha_size:]
+            dc_weight = rearrange(dc_weight, "... (s f) -> ... s f", s=streams)
+            dynamic_beta = dc_weight * self.h_post_scale
+            static_beta = rearrange(self.static_beta, "... (s f) -> ... s f", s=streams)
+            beta = dynamic_beta + static_beta
+            beta = (beta.sigmoid() * 2).to(residual_dtype)
+
+        mix_h = einsum(alpha, residuals, "... f1 s f2 t, ... f1 s d -> ... f2 t d")
+
+        if self.num_input_views == 1:
+            branch_input, residuals = mix_h[..., 0, :], mix_h[..., 1:, :]
+        else:
+            branch_input, residuals = (
+                mix_h[..., : self.num_input_views, :],
+                mix_h[..., self.num_input_views :, :],
+            )
+            branch_input = rearrange(branch_input, "b ... v d -> v b ... d")
+
+        if self.channel_first:
+            branch_input = rearrange(branch_input, "b ... d -> b d ...")
+
+        branch_input = self.merge_fracs(branch_input)
+        residuals = rearrange(residuals, "b ... s d -> (b s) ... d")
+        if self.channel_first:
+            residuals = rearrange(residuals, "b ... d -> b d ...")
+        residuals = self.merge_fracs(residuals)
+        return branch_input, residuals, dict(beta=beta)
+
+    def depth_connection(self, branch_output, residuals, *, beta):
+        assert self.add_branch_out_to_residual
+
+        branch_output = self.split_fracs(branch_output)
+
+        if self.channel_first:
+            branch_output = rearrange(branch_output, "b d ... -> b ... d")
+
+        output = einsum(
+            branch_output, beta.to(branch_output.dtype),
+            "b ... f1 d, b ... f1 s f2 -> b ... f2 s d",
+        )
+        output = rearrange(output, "b ... s d -> (b s) ... d")
+        output = self.merge_fracs(output)
+
+        if self.channel_first:
+            output = rearrange(output, "b ... d -> b d ...")
+
+        residuals = self.depth_residual_fn(output, residuals)
+        return self.dropout(residuals)
+
+    def decorate_branch(self, branch: Callable):
+        assert not exists(self.branch), "branch was already wrapped on init"
+
+        def forward_and_add_residual(residual, *args, **kwargs):
+            branch_input, add_residual = self.forward(residual)
+            branch_output = branch(branch_input, *args, **kwargs)
+            return add_residual(branch_output)
+
+        return forward_and_add_residual
+
+    def forward(self, residuals, *branch_args, **branch_kwargs):
+        branch_input, residuals, residual_kwargs = self.width_connection(residuals)
+
+        def add_residual_fn(branch_out):
+            if not self.add_branch_out_to_residual:
+                return branch_out
+            (branch_out, *rest), tree_spec = torch.utils._pytree.tree_flatten(branch_out)
+            branch_out = self.depth_connection(branch_out, residuals, **residual_kwargs)
+            return torch.utils._pytree.tree_unflatten((branch_out, *rest), tree_spec)
+
+        if not exists(self.branch):
+            return branch_input, add_residual_fn
+
+        branch_output = self.branch(branch_input, *branch_args, **branch_kwargs)
+        return add_residual_fn(branch_output)
+
+
+KromHC.get_expand_reduce_stream_functions = staticmethod(get_expand_reduce_stream_functions)
+KromHC.get_init_and_expand_reduce_stream_functions = staticmethod(
     get_init_and_expand_reduce_stream_functions
 )
 
