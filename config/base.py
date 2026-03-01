@@ -89,13 +89,13 @@ data_config = dict(
 batch_schedule_config = dict(
     schedule_type="stepped",
     # Keep these aligned with the stepped schedule for logging/compatibility.
-    initial_grad_accum_steps=1,
+    initial_grad_accum_steps=8,
     final_grad_accum_steps=8,
     warmup_frac=0.5,
-    # Triple doubling across training: 1x -> 2x -> 4x -> 8x.
-    batch_sizes=[1, 2, 4, 8],
+    # Constant max batch from step 0.
+    batch_sizes=[8],
     base_tokens=TRAIN_SEQ_LEN * BATCH_SIZE_MULTIPLE,
-    transitions=[0.25, 0.50, 0.75],
+    transitions=[],
 )
 
 window_schedule_config = dict(
@@ -106,9 +106,9 @@ window_schedule_config = dict(
 )
 
 training_config = dict(
-    num_iterations=420,
-    num_scheduled_iterations=320,
-    cooldown_frac=0.40,
+    num_iterations=500,
+    num_scheduled_iterations=380,
+    cooldown_frac=0.50,
     final_lr_ratio=0.1,
     val_loss_every=50,
     save_checkpoint=False,
@@ -131,8 +131,8 @@ optimizer_config = dict(
     matrix_optimizer="muon",  # "muon", "spectron", "aro", "bam", or "lite"
     apply_lr_scale_to_weight_decay=False,
     adam=dict(
-        lr=0.006,
-        betas=(0.65, 0.95),
+        lr=0.01,
+        betas=(0.80, 0.95),
         eps=1e-8,
         weight_decay=0.005,
     ),
@@ -143,8 +143,8 @@ optimizer_config = dict(
         weight_decay=0.0,
     ),
     muon=dict(
-        lr=0.02,
-        weight_decay=1.2,
+        lr=0.015,
+        weight_decay=0.8,
         momentum=0.95,
         momentum_min=0.85,
         momentum_warmup_frac=0.10,
