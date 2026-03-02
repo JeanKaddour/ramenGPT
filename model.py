@@ -1327,6 +1327,8 @@ class CausalSelfAttention(nn.Module):
         attn_scale: float,
         docs: Tensor,
         key_offset: bool = False,
+        kv_cache: dict | None = None,
+        cache_docs: Tensor | None = None,
     ):
         B, T = x.size(0), x.size(1)
         # Apply sa_lambdas[0] to QKV weights (from train_gpt.py)
@@ -1362,6 +1364,58 @@ class CausalSelfAttention(nn.Module):
         elif ve is not None:
             # Fallback to lambda-based mixing if no gate
             v = v + ve.view_as(v)
+
+        if kv_cache is not None and T == 1 and kv_cache.get("k") is not None:
+            cache_k = kv_cache.get("k")
+            cache_v = kv_cache.get("v")
+            cache_len = 0 if cache_k is None else cache_k.shape[2]
+
+            if key_offset and cache_len > 0:
+                prev_k = cache_k[:, :, -1:, :]
+                k[:, :, self.head_dim // 4 : self.head_dim // 2] = prev_k[:, :, :, self.head_dim // 4 : self.head_dim // 2]
+                k[:, :, 3 * self.head_dim // 4 :] = prev_k[:, :, :, 3 * self.head_dim // 4 :]
+            # Append current token cache to existing prefix.
+            if cache_k is None:
+                cat_k = k
+                cat_v = v
+            else:
+                cat_k = torch.cat([cache_k, k], dim=2)
+                cat_v = torch.cat([cache_v, v], dim=2)
+
+            # Include current token for self-attention; allow only same-document positions.
+            if cache_docs is None:
+                cache_docs = torch.empty(0, dtype=torch.int32, device=x.device)
+            current_doc = docs[0]
+            full_docs = torch.cat([cache_docs.to(torch.int32), current_doc.view(1)])
+            same_doc = full_docs == current_doc
+            allow = same_doc
+            scores = torch.einsum("bthd,bhSd->bthS", q, cat_k) * float(attn_scale)
+            scores = scores.masked_fill(~allow.view(1, 1, 1, -1), float("-inf"))
+            attn = F.softmax(scores, dim=-1)
+            y = torch.einsum("bthS,bhSd->bthd", attn, cat_v)
+
+            # Attention gating (from train_gpt.py)
+            if self.attn_gate is not None:
+                y = y * torch.sigmoid(self.attn_gate(x[..., : self.attn_gate.weight.size(-1)])).view(
+                    B, T, self.num_heads, 1
+                )
+
+            y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+
+            # Output projection using merged weights with sa_lambdas[1]
+            if isinstance(self.qkvo_w, LowRankLinear):
+                o_A = self.qkvo_w.A[self.dim * 3 :, :].type_as(y)
+                y = F.linear(y, self.qkvo_w.B.type_as(y))
+                y = F.linear(y, o_A)
+            else:
+                o_weight = self.qkvo_w[self.dim * 3 :].type_as(y)
+                y = F.linear(y, sa_lambdas[1] * o_weight)
+            if isinstance(self.qkvo_w, LowRankLinear):
+                y = sa_lambdas[1] * y
+
+            kv_cache["k"] = cat_k
+            kv_cache["v"] = cat_v
+            return y
 
         # Element-wise mask for FlexAttention
         def score_mod(score, b, h, q_idx, kv_idx):
@@ -1399,6 +1453,10 @@ class CausalSelfAttention(nn.Module):
             y = F.linear(y, sa_lambdas[1] * o_weight)
         if isinstance(self.qkvo_w, LowRankLinear):
             y = sa_lambdas[1] * y
+
+        if kv_cache is not None and kv_cache.get("k") is None:
+            kv_cache["k"] = k
+            kv_cache["v"] = v
         return y
 
 
@@ -1470,11 +1528,23 @@ class Block(nn.Module):
         attn_scale: float,
         docs: Tensor,
         key_offset: bool = False,
+        kv_cache: dict | None = None,
+        cache_docs: Tensor | None = None,
     ):
         # Attention branch
         if self.attn is not None:
             attn_out = self.attn(
-                norm(x), ve, sa_lambdas, block_mask, cos, sin, attn_scale, docs, key_offset
+                norm(x),
+                ve,
+                sa_lambdas,
+                block_mask,
+                cos,
+                sin,
+                attn_scale,
+                docs,
+                key_offset,
+                kv_cache=kv_cache,
+                cache_docs=cache_docs,
             )
             x = x + attn_out
         # MLP branch — variants with internal norms skip the external norm()
@@ -1494,13 +1564,25 @@ class Block(nn.Module):
         attn_scale: float,
         docs: Tensor,
         key_offset: bool = False,
+        kv_cache: dict | None = None,
+        cache_docs: Tensor | None = None,
     ):
         residual = x
 
         # Attention branch
         if self.attn is not None:
             attn_out = self.attn(
-                norm(x), ve, sa_lambdas, block_mask, cos, sin, attn_scale, docs, key_offset
+                norm(x),
+                ve,
+                sa_lambdas,
+                block_mask,
+                cos,
+                sin,
+                attn_scale,
+                docs,
+                key_offset,
+                kv_cache=kv_cache,
+                cache_docs=cache_docs,
             )
             x = x + attn_out
 
@@ -1521,14 +1603,36 @@ class Block(nn.Module):
         attn_scale: float,
         docs: Tensor,
         key_offset: bool = False,
+        kv_cache: dict | None = None,
+        cache_docs: Tensor | None = None,
     ):
         if self.residual_connection is not None:
             return self.residual_connection(
-                x, ve, sa_lambdas, block_mask, cos, sin, attn_scale, docs, key_offset
+                x,
+                ve,
+                sa_lambdas,
+                block_mask,
+                cos,
+                sin,
+                attn_scale,
+                docs,
+                key_offset,
+                kv_cache=kv_cache,
+                cache_docs=cache_docs,
             )
 
         return self._forward_standard(
-            x, ve, sa_lambdas, block_mask, cos, sin, attn_scale, docs, key_offset
+            x,
+            ve,
+            sa_lambdas,
+            block_mask,
+            cos,
+            sin,
+            attn_scale,
+            docs,
+            key_offset,
+            kv_cache=kv_cache,
+            cache_docs=cache_docs,
         )
 
 
@@ -1777,6 +1881,13 @@ class GPT(nn.Module):
             self.embed.weight.wd_mul = self._model_wd_multipliers["embed"]
         self.split_embed = True
 
+    def create_kv_cache(self):
+        return {
+            "layers": [{"k": None, "v": None} for _ in range(self.num_layers)],
+            "docs": torch.empty(0, dtype=torch.int32, device=self.lm_head.weight.device),
+            "smear_state": None,
+        }
+
     def create_blockmasks(self, docs: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = self.attention_config["block_size"]
         # docs passed in
@@ -1829,8 +1940,32 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def forward(
+        self,
+        input_seq: Tensor,
+        target_seq: Tensor,
+        sliding_window_num_blocks: Tensor,
+        return_logits: bool = False,
+        kv_cache: dict | None = None,
+    ):
         assert input_seq.ndim == 1
+        cache_layers = None
+        cache_docs = None
+        cache_smear_state = None
+        is_decode = False
+        if kv_cache is not None:
+            if "layers" not in kv_cache:
+                kv_cache["layers"] = [{"k": None, "v": None} for _ in range(self.num_layers)]
+            cache_layers = kv_cache.get("layers")
+            cache_docs = kv_cache.get("docs")
+            cache_smear_state = kv_cache.get("smear_state")
+            is_decode = (
+                input_seq.numel() == 1
+                and cache_docs is not None
+                and cache_docs.numel() > 0
+                and cache_layers is not None
+                and len(cache_layers) == self.num_layers
+            )
 
         # Get skip/backout config
         skip_in_layers = self.skip_config["skip_in_layers"]
@@ -1858,9 +1993,16 @@ class GPT(nn.Module):
             requires_mask.append(needs)
             any_requires_mask = any_requires_mask or needs
 
-        docs = (input_seq == self._eos_token_id).cumsum(0)
+        if is_decode:
+            assert cache_docs is not None
+            current_doc = cache_docs[-1] + (input_seq[-1] == self._eos_token_id).to(
+                cache_docs.dtype
+            )
+            docs = current_doc.view(1)
+        else:
+            docs = (input_seq == self._eos_token_id).cumsum(0)
 
-        if any_requires_mask:
+        if any_requires_mask and not is_decode:
             long_bm, short_bm = self.create_blockmasks(docs, sliding_window_num_blocks)
         block_masks = []
         key_offsets = []  # Key offset flags for each layer (True for long windows)
@@ -1891,11 +2033,15 @@ class GPT(nn.Module):
 
         # Smear gate: shift token embeddings forward (from train_gpt.py @classiclarryd)
         smear_lambda = self.scalars[3 * self.num_layers]
+        x_raw = x
         if self.smear_gate is not None:
-            smear_gate_out = smear_lambda * torch.sigmoid(
-                self.smear_gate(x[1:, : self.smear_gate.weight.size(-1)])
-            )
-            x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
+            gate_width = self.smear_gate.weight.size(-1)
+            if x.shape[0] == 1 and cache_smear_state is not None:
+                smear_gate_out = torch.sigmoid(self.smear_gate(x[:, :gate_width]))
+                x = x_raw + (smear_lambda * smear_gate_out) * cache_smear_state.view(1, 1, -1)
+            else:
+                smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :gate_width]))
+                x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
 
         x = x0 = norm(x[None])
         x = self._residual_connection_expand(x)
@@ -1935,9 +2081,18 @@ class GPT(nn.Module):
             else:
                 x = resid_lambdas[i] * x + x0_lambdas[i] * x0
 
-            # Forward through block with key_offset for long window layers
             x = self.blocks[i](
-                x, ve[i], sa_lambdas[i], block_masks[i], cos, sin, attn_scale, docs, key_offsets[i]
+                x,
+                ve[i],
+                sa_lambdas[i],
+                block_masks[i] if not is_decode else None,
+                cos,
+                sin,
+                attn_scale,
+                docs,
+                key_offsets[i],
+                kv_cache=cache_layers[i] if cache_layers is not None else None,
+                cache_docs=cache_docs,
             )
 
             # Save skip connection
@@ -1963,14 +2118,30 @@ class GPT(nn.Module):
         )
         logits_for_loss = logits.float() if not self.training else logits
 
+        if kv_cache is not None and is_decode:
+            if cache_docs is None:
+                kv_cache["docs"] = docs.to(dtype=torch.int32)
+            else:
+                kv_cache["docs"] = torch.cat([cache_docs, docs.to(dtype=torch.int32)])
+        elif kv_cache is not None:
+            kv_cache["docs"] = docs.to(dtype=torch.int32)
+        if kv_cache is not None:
+            if self.smear_gate is not None:
+                kv_cache["smear_state"] = x_raw[-1].detach()
+            else:
+                kv_cache["smear_state"] = None
+
         # Language modeling loss
+        if return_logits:
+            return logits_for_loss[:, : self.vocab_size]
+
         if self.training:
-            loss = F.cross_entropy(
+            return F.cross_entropy(
                 logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum"
             )
-        else:
-            loss = F.cross_entropy(
-                logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean"
-            )
 
-        return loss
+        return F.cross_entropy(
+            logits_for_loss.view(-1, logits_for_loss.size(-1)),
+            target_seq,
+            reduction="mean",
+        )
