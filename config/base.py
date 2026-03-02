@@ -162,6 +162,7 @@ optimizer_config = dict(
         beta2=0.0,
         nesterov=True,
         sinkhorn_iters=5,
+        rms_norm_target=0.2,
     ),
     bam=dict(
         lr=0.02,
