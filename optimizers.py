@@ -131,7 +131,6 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                 weight_decay=aro_cfg.get("weight_decay", 0.0),
                 nesterov=aro_cfg.get("nesterov", True),
                 sinkhorn_iters=aro_cfg.get("sinkhorn_iters", 5),
-                rms_norm_target=aro_cfg.get("rms_norm_target", 0.0),
                 transpose_aware=aro_cfg.get("transpose_aware", False),
                 scale_weight_decay_by_lr=scale_weight_decay_by_lr,
             )
@@ -897,7 +896,6 @@ class AROSinkhorn(torch.optim.Optimizer):
         weight_decay=0.0,
         nesterov=True,
         sinkhorn_iters=5,
-        rms_norm_target=0.0,
         transpose_aware=False,
         scale_weight_decay_by_lr=False,
     ):
@@ -908,7 +906,6 @@ class AROSinkhorn(torch.optim.Optimizer):
             weight_decay=weight_decay,
             nesterov=nesterov,
             sinkhorn_iters=sinkhorn_iters,
-            rms_norm_target=rms_norm_target,
             transpose_aware=transpose_aware,
             scale_weight_decay_by_lr=scale_weight_decay_by_lr,
         )
@@ -946,7 +943,6 @@ class AROSinkhorn(torch.optim.Optimizer):
             wd = group["weight_decay"]
             beta2 = group["beta2"]
             sinkhorn_iters = group["sinkhorn_iters"]
-            rms_norm_target = group["rms_norm_target"]
             scale_weight_decay_by_lr = group["scale_weight_decay_by_lr"]
 
             for p in group["params"]:
@@ -1012,13 +1008,6 @@ class AROSinkhorn(torch.optim.Optimizer):
                     delta = apply_normuon_variance_reduction(
                         delta, state["second_momentum_buffer"], beta2, red_dim
                     )
-
-                # RMS clipping (inspired by ARO paper Section 4.4)
-                # Cap update at target RMS but don't amplify small updates
-                if rms_norm_target > 0:
-                    rms = delta.norm() / (delta.numel() ** 0.5)
-                    scale = min(rms_norm_target / rms.clamp_min(1e-8), 1.0)
-                    delta = delta * scale
 
                 # Apply shape multiplier, lr_mul, masked weight decay (same as NorMuon)
                 shape_mult = max(1.0, p.size(-2) / p.size(-1)) ** 0.5

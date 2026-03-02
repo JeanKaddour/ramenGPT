@@ -153,16 +153,15 @@ optimizer_config = dict(
         nesterov=True,
     ),
     aro=dict(
-        lr=0.002,
+        lr=0.0003,
         weight_decay=0.1,
         momentum=0.95,
         momentum_min=0.85,
         momentum_warmup_frac=0.10,
         momentum_cooldown_frac=0.10,
         beta2=0.0,
-        nesterov=False,
+        nesterov=True,
         sinkhorn_iters=5,
-        rms_norm_target=0.2,
     ),
     bam=dict(
         lr=0.02,
