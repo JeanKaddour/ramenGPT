@@ -101,7 +101,7 @@ batch_schedule_config = dict(
 window_schedule_config = dict(
     schedule=[3],
     final_ws=3,
-    post_yarn_extension=6,
+    post_yarn_extension=12,
     transitions=[1.0],
 )
 
@@ -153,15 +153,16 @@ optimizer_config = dict(
         nesterov=True,
     ),
     aro=dict(
-        lr=0.02,
-        weight_decay=1.2,
+        lr=0.002,
+        weight_decay=0.1,
         momentum=0.95,
         momentum_min=0.85,
         momentum_warmup_frac=0.10,
         momentum_cooldown_frac=0.10,
         beta2=0.0,
-        nesterov=True,
+        nesterov=False,
         sinkhorn_iters=5,
+        rms_norm_target=0.2,
     ),
     bam=dict(
         lr=0.02,
@@ -271,6 +272,17 @@ logging_config = dict(
     use_wandb=True,
     wandb_project="ramenGPT",
     wandb_run_name=None,
+)
+
+validation_inference = dict(
+    enabled=False,
+    num_samples=3,
+    prompt_tokens=128,
+    max_new_tokens=80,
+    temperature=0.8,
+    top_k=40,
+    seed=42,
+    stop_on_eos=True,
 )
 
 compilation_config = dict(
