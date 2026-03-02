@@ -1017,7 +1017,7 @@ class AROSinkhorn(torch.optim.Optimizer):
                 # Cap update at target RMS but don't amplify small updates
                 if rms_norm_target > 0:
                     rms = delta.norm() / (delta.numel() ** 0.5)
-                    scale = min(rms_norm_target / rms.clamp_min(1e-8), 1.0)
+                    scale = rms_norm_target / rms.clamp_min(1e-8)
                     delta = delta * scale
 
                 # Apply shape multiplier, lr_mul, masked weight decay (same as NorMuon)
