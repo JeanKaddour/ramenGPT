@@ -12,9 +12,11 @@ import time
 import torch
 from torch import Tensor, nn
 import torch.nn.utils as nn_utils
+import tiktoken
 
 from model import GPT, next_multiple_of_n, set_flex_attention_kernel_options
 from optimizers import create_optimizer
+from inference import run_validation_generation
 import wandb
 
 
@@ -542,6 +544,13 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     wd_multipliers = optimizer_config.get("wd_multipliers", {})
     low_rank_config = getattr(config, "low_rank_config", None)
     residual_connection_config = getattr(config, "residual_connection_config", None)
+    validation_inference = getattr(config, "validation_inference", {})
+    if not isinstance(validation_inference, dict):
+        validation_inference = {}
+    validation_inference = dict(validation_inference)
+    run_validation_text_inference = bool(validation_inference.get("enabled", False))
+    validation_inference_config = dict(validation_inference)
+    validation_inference_config.pop("enabled", None)
 
     # New config sections for train_gpt.py alignment
     gating_config = getattr(config, "gating_config", None)
@@ -657,6 +666,8 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
 
+    tokenizer = tiktoken.get_encoding("gpt2")
+
     # Initialize wandb after model creation
     if logging_config["use_wandb"]:
         # Generate descriptive run name with model type and key parameters
@@ -751,6 +762,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             **training_config,
             **optimizer_config,
             **batch_schedule_config,
+            **validation_inference_config,
             "low_rank_config": low_rank_config or {},
             "config_file": args.config,
             "batch_size_multiple": micro_batch_size,
@@ -763,6 +775,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             "early_stop_steps": args.early_stop_steps,
             "activation": activation_name,  # Explicitly track activation function
             "residual_connection_config": residual_connection_config or {},
+            "validation_inference_enabled": run_validation_text_inference,
         }
 
         wandb.init(
@@ -1053,6 +1066,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     first_train_step_time_s = None
     first_train_tokens_processed = None
     prev_train_step_time_s = None
+    final_step = -1
     # begin training
     train_steps = training_config["num_iterations"]
     # Limit iterations to early_stop_steps if specified
@@ -1128,6 +1142,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     t0 = time.perf_counter()
 
     for step in range(max_steps):
+        final_step = step
         # Advance training schedules (batch size, window size, embed split)
         training_manager.advance_schedule(step)
 
@@ -1457,6 +1472,46 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             log_dict.update(grad_norm_dict)
 
             wandb.log(log_dict, step=step + 1)
+
+    final_inference_step = final_step if final_step >= 0 else train_steps
+    if logging_config["use_wandb"] and run_validation_text_inference:
+        if model_type != "gpt":
+            print_log("Skipping validation text generation: inference helper is GPT-only.")
+        else:
+            try:
+                val_generation_loader = single_gpu_data_generator(
+                    data_config["val_files"],
+                    data_config["val_seq_len"],
+                    data_config["val_seq_len"],
+                    align_to_bos=False,
+                )
+                generation_rows = run_validation_generation(
+                    model=model,
+                    tokenizer=tokenizer,
+                    val_loader=val_generation_loader,
+                    window_size_blocks=get_window_size_blocks(final_inference_step),
+                    data_seq_len=data_config["val_seq_len"],
+                    config=validation_inference_config,
+                )
+            except Exception as e:
+                print_log(f"Validation text generation failed: {e}")
+                generation_rows = []
+
+            if generation_rows:
+                generation_table = wandb.Table(
+                    columns=["prompt", "generated", "prompt_len", "generated_len"]
+                )
+                for row in generation_rows:
+                    generation_table.add_data(
+                        row["prompt"],
+                        row["generated"],
+                        row["prompt_len"],
+                        row["generated_len"],
+                    )
+                wandb.log(
+                    {"validation_generation": generation_table},
+                    step=final_inference_step,
+                )
 
     peak_memory = torch.cuda.max_memory_allocated() // 1024 // 1024
     reserved_memory = torch.cuda.max_memory_reserved() // 1024 // 1024
