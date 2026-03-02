@@ -849,19 +849,16 @@ class BAM(torch.optim.Optimizer):
 
 @torch.compile(dynamic=False, fullgraph=True)
 def sinkhorn_normalize(X: torch.Tensor, num_iters: int = 5):
-    """Alternating row/column L2 normalization for ARO.
+    """Simultaneous row/column L2 normalization for ARO (Algorithm 1 from the paper).
 
-    Normalizes rows then columns sequentially each iteration (standard Sinkhorn).
-    Order adapts to matrix shape for better conditioning.
+    Both row and column norms are computed from the same X and applied together
+    each iteration: X ← Q(X)^{-1} X R(X)^{-1}.
     """
     X = X.float()
     for _ in range(num_iters):
-        if X.shape[-2] >= X.shape[-1]:
-            X = X / X.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-            X = X / X.norm(dim=-2, keepdim=True).clamp_min(1e-8)
-        else:
-            X = X / X.norm(dim=-2, keepdim=True).clamp_min(1e-8)
-            X = X / X.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        row_norms = X.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        col_norms = X.norm(dim=-2, keepdim=True).clamp_min(1e-8)
+        X = X / row_norms / col_norms
     return X
 
 
