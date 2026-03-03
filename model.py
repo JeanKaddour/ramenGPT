@@ -1207,7 +1207,18 @@ class StandardRoPE(PositionalEmbedding):
 
 
 class NoPositionalEmbedding(PositionalEmbedding):
-    """Identity positional embedding: cos=1, sin=0 so rotary() is a no-op."""
+    """No positional encoding (NoPE/NoPos).
+
+    Sets cos=1, sin=0 so rotary() is a no-op. The model learns implicit
+    positional information from the causal attention mask alone.
+
+    Refs:
+    - Kazemnejad et al., "The Impact of Positional Encoding on Length
+      Generalization in Transformers", NeurIPS 2023 (arXiv:2305.19466)
+    - Haviv et al., "Transformer Language Models without Positional
+      Encodings Still Learn Positional Information", EMNLP 2022
+      (arXiv:2203.16634)
+    """
 
     def __init__(self, head_dim: int, max_seq_len: int, initial_attn_scale: float = 0.1):
         super().__init__()
@@ -1240,10 +1251,10 @@ def create_positional_embedding(rope_config: dict, head_dim: int, max_seq_len: i
         return HalfRoPE(head_dim, max_seq_len, base_freq, initial_attn_scale)
     if rope_type == "rope":
         return StandardRoPE(head_dim, max_seq_len, base_freq, initial_attn_scale)
-    if rope_type == "none":
+    if rope_type in ("none", "nope"):
         return NoPositionalEmbedding(head_dim, max_seq_len, initial_attn_scale)
 
-    supported = ["yarn", "half_rope", "rope", "none"]
+    supported = ["yarn", "half_rope", "rope", "none", "nope"]
     raise ValueError(f"Unsupported rope type: {rope_type!r}. Supported: {', '.join(supported)}")
 
 

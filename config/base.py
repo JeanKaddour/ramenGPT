@@ -36,7 +36,7 @@ gating_config = dict(
 )
 
 rope_config = dict(
-    type="yarn",           # "yarn", "half_rope", "rope", or "none"
+    type="yarn",           # "yarn", "half_rope", "rope", "none", or "nope"
     base_freq=1024,
     initial_attn_scale=0.1,
 )
@@ -159,7 +159,7 @@ optimizer_config = dict(
         momentum_min=0.85,
         momentum_warmup_frac=0.10,
         momentum_cooldown_frac=0.10,
-        beta2=0.0,
+        beta2=0.95,
         nesterov=True,
         sinkhorn_iters=5,
         rms_norm_target=0.2,
