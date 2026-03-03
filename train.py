@@ -187,6 +187,11 @@ class TrainingManager:
         # Track transitions for scalar freeze
         self.freeze_steps = self.optimizer_config.get("freeze_scalars_on_transition", 40)
 
+        # MTP (multi-token prediction) schedule
+        self.mtp_config = config.get("mtp_config", {})
+        self.mtp_enabled = bool(self.mtp_config.get("enabled", False))
+        self._mtp_stage_idx = 0
+
     def get_batch_size(self, step: int) -> int:
         """Get batch size (grad accum steps) for current step using stepped schedule."""
         schedule_type = self.batch_schedule_config.get("schedule_type", "stepped")
@@ -254,6 +259,50 @@ class TrainingManager:
         ws = self.get_window_size(step)
         return torch.tensor(ws * block_size // block_size, dtype=torch.int32, device="cuda")
 
+    def get_mtp_weights(self, step: int) -> Tensor | None:
+        """Get MTP weight tensor for current step, or None if MTP is disabled."""
+        if not self.mtp_enabled:
+            return None
+
+        schedule = self.mtp_config.get("schedule", [])
+        transitions = self.mtp_config.get("transitions", [])
+        if not schedule:
+            return None
+
+        progress = step / self.num_scheduled_iterations
+
+        # Determine current stage
+        stage_idx = len(transitions)  # default to last stage
+        for i, trans in enumerate(transitions):
+            if progress < trans:
+                stage_idx = i
+                break
+
+        stage = schedule[min(stage_idx, len(schedule) - 1)]
+        weights_start = stage["mtp_weights_start"]
+        weights_end = stage["mtp_weights_end"]
+
+        # Compute linear interpolation within the stage
+        if stage_idx == 0:
+            stage_start_frac = 0.0
+        else:
+            stage_start_frac = transitions[stage_idx - 1]
+
+        if stage_idx < len(transitions):
+            stage_end_frac = transitions[stage_idx]
+        else:
+            stage_end_frac = 1.0
+
+        stage_len = stage_end_frac - stage_start_frac
+        if stage_len > 0:
+            t = (progress - stage_start_frac) / stage_len
+            t = max(0.0, min(1.0, t))
+        else:
+            t = 1.0
+
+        weights = [s + t * (e - s) for s, e in zip(weights_start, weights_end)]
+        return torch.tensor(weights, device="cuda", dtype=torch.float32)
+
     def advance_schedule(self, step: int):
         """
         Update schedules and model state for the given step.
@@ -299,6 +348,26 @@ class TrainingManager:
                 self.model.pos_emb.apply(old_ws, new_ws)
             self.current_window_size = new_ws
             self.scalar_freeze_countdown = self.freeze_steps
+
+        # Check for MTP stage transitions
+        if self.mtp_enabled:
+            mtp_transitions = self.mtp_config.get("transitions", [])
+            mtp_schedule = self.mtp_config.get("schedule", [])
+            progress = step / self.num_scheduled_iterations
+            new_mtp_stage = len(mtp_transitions)
+            for i, trans in enumerate(mtp_transitions):
+                if progress < trans:
+                    new_mtp_stage = i
+                    break
+            if new_mtp_stage != self._mtp_stage_idx:
+                stage = mtp_schedule[min(new_mtp_stage, len(mtp_schedule) - 1)]
+                num_offsets = len(stage["mtp_weights_start"])
+                self.print_fn(
+                    f"Step {step}: MTP stage transition {self._mtp_stage_idx} -> {new_mtp_stage} "
+                    f"(num_offsets={num_offsets})"
+                )
+                self._mtp_stage_idx = new_mtp_stage
+                self.scalar_freeze_countdown = self.freeze_steps
 
         # Check for embed/lm_head split
         if self.embed_split_enabled and not self.embed_split_done and step == self.split_step:
@@ -626,6 +695,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             m.weight.data = m.weight.data.bfloat16()
 
     # Create TrainingManager
+    mtp_config = getattr(config, "mtp_config", {})
     training_manager_config = {
         "training_config": training_config,
         "batch_schedule_config": batch_schedule_config,
@@ -633,6 +703,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         "embed_config": embed_config or {},
         "data_config": data_config,
         "optimizer_config": optimizer_config,
+        "mtp_config": mtp_config or {},
     }
     training_manager = TrainingManager(model, training_manager_config, print_fn=print)
 
@@ -966,12 +1037,13 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     # Use smaller sequence length for warmup if specified
     warmup_seq_len = warmup_config.get("warmup_seq_len") or data_config["train_seq_len"]
     print_log(f"Running warmup with sequence length: {warmup_seq_len}")
+    warmup_mtp_weights = training_manager.get_mtp_weights(0)
     for _ in range(warmup_steps):
         inputs = targets = torch.randint(
             0, model_config["vocab_size"], size=(warmup_seq_len,), device="cuda"
         )
         if model_type == "gpt":
-            loss = model(inputs.to(torch.int32), targets, get_window_size_blocks(0))
+            loss = model(inputs.to(torch.int32), targets, get_window_size_blocks(0), mtp_weights=warmup_mtp_weights)
         else:
             # SSM models expect different input format
             outputs = model(
@@ -1268,10 +1340,11 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         train_loss_accum = 0.0
         train_tokens_this_step = 0
 
+        mtp_weights = training_manager.get_mtp_weights(step)
         for micro_step in range(grad_accum_steps):
             inputs, targets = next(train_loader)
             if model_type == "gpt":
-                loss = model(inputs, targets, get_window_size_blocks(step))
+                loss = model(inputs, targets, get_window_size_blocks(step), mtp_weights=mtp_weights)
                 # Match train_gpt.py: loss is summed over tokens, scale only by grad_accum_steps
                 # so the gradient corresponds to the total token loss per iteration.
                 train_loss_accum += loss.detach()
@@ -1468,6 +1541,13 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                     else None
                 ),
             }
+
+            # MTP metrics
+            if mtp_weights is not None:
+                mtp_w = mtp_weights.tolist()
+                log_dict["mtp_num_offsets"] = len(mtp_w)
+                for i, w in enumerate(mtp_w):
+                    log_dict[f"mtp_weight_{i}"] = w
 
             log_dict.update(grad_norm_dict)
 

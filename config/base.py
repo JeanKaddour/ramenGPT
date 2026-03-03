@@ -285,6 +285,16 @@ validation_inference = dict(
     stop_on_eos=True,
 )
 
+mtp_config = dict(
+    enabled=True,
+    schedule=[
+        dict(mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
+        dict(mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
+        dict(mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
+    ],
+    transitions=[1/3, 2/3],
+)
+
 compilation_config = dict(
     compile_model=True,
     relaxed_compile=True,

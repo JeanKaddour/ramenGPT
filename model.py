@@ -1951,6 +1951,24 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
+    def _compute_mtp_loss(self, logits_flat: Tensor, target_seq: Tensor, mtp_weights: Tensor):
+        """Compute multi-token prediction loss with weighted offsets.
+
+        For offset k, evaluates logits[:-k] against target_seq[k:], naturally
+        excluding positions without valid future targets.
+        """
+        total_loss = torch.tensor(0.0, device=logits_flat.device, dtype=logits_flat.dtype)
+        seq_len = logits_flat.size(0)
+        for k, w in enumerate(mtp_weights.tolist()):
+            if w == 0.0 or k >= seq_len:
+                continue
+            if k == 0:
+                loss_k = F.cross_entropy(logits_flat, target_seq, reduction="sum")
+            else:
+                loss_k = F.cross_entropy(logits_flat[:-k], target_seq[k:], reduction="sum")
+            total_loss = total_loss + w * loss_k
+        return total_loss
+
     def forward(
         self,
         input_seq: Tensor,
@@ -1958,6 +1976,7 @@ class GPT(nn.Module):
         sliding_window_num_blocks: Tensor,
         return_logits: bool = False,
         kv_cache: dict | None = None,
+        mtp_weights: Tensor | None = None,
     ):
         assert input_seq.ndim == 1
         cache_layers = None
@@ -2147,9 +2166,10 @@ class GPT(nn.Module):
             return logits_for_loss[:, : self.vocab_size]
 
         if self.training:
-            return F.cross_entropy(
-                logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="sum"
-            )
+            logits_flat = logits_for_loss.view(-1, logits_for_loss.size(-1))
+            if mtp_weights is not None:
+                return self._compute_mtp_loss(logits_flat, target_seq, mtp_weights)
+            return F.cross_entropy(logits_flat, target_seq, reduction="sum")
 
         return F.cross_entropy(
             logits_for_loss.view(-1, logits_for_loss.size(-1)),
