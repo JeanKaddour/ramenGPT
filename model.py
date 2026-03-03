@@ -1954,20 +1954,34 @@ class GPT(nn.Module):
     def _compute_mtp_loss(self, logits_flat: Tensor, target_seq: Tensor, mtp_weights: Tensor):
         """Compute multi-token prediction loss with weighted offsets.
 
-        For offset k, evaluates logits[:-k] against target_seq[k:], naturally
-        excluding positions without valid future targets.
+        Stacks shifted targets (padded with ignore_index for invalid tail
+        positions), expands logits, and computes the entire MTP loss as a
+        single F.cross_entropy call for better torch.compile fusion.
         """
-        total_loss = torch.tensor(0.0, device=logits_flat.device, dtype=logits_flat.dtype)
+        num_offsets = mtp_weights.size(0)
         seq_len = logits_flat.size(0)
-        for k, w in enumerate(mtp_weights.tolist()):
-            if w == 0.0 or k >= seq_len:
-                continue
-            if k == 0:
-                loss_k = F.cross_entropy(logits_flat, target_seq, reduction="sum")
-            else:
-                loss_k = F.cross_entropy(logits_flat[:-k], target_seq[k:], reduction="sum")
-            total_loss = total_loss + w * loss_k
-        return total_loss
+
+        # Stack shifted targets with -100 padding: (num_offsets, seq_len)
+        shifted = [target_seq]
+        for k in range(1, num_offsets):
+            pad = target_seq.new_full((k,), -100)
+            shifted.append(torch.cat([target_seq[k:], pad]))
+        targets_stacked = torch.stack(shifted)
+
+        # Expand logits to match: (num_offsets, seq_len, V) — expand is free
+        logits_expanded = logits_flat.unsqueeze(0).expand(num_offsets, -1, -1)
+
+        # Single batched cross-entropy with ignore_index for padded positions
+        per_token_loss = F.cross_entropy(
+            logits_expanded.reshape(-1, logits_expanded.size(-1)),
+            targets_stacked.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).view(num_offsets, seq_len)
+
+        # Weighted sum: sum over tokens, then dot with weights
+        per_offset_loss = per_token_loss.sum(dim=1)
+        return (mtp_weights * per_offset_loss).sum()
 
     def forward(
         self,
