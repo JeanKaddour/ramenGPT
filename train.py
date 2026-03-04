@@ -190,6 +190,8 @@ class TrainingManager:
         # MTP (multi-token prediction) schedule
         self.mtp_config = config.get("mtp_config", {})
         self.mtp_enabled = bool(self.mtp_config.get("enabled", False))
+        self._mtp_schedule = self.mtp_config.get("schedule", [])
+        self._mtp_transitions = self.mtp_config.get("transitions", [])
         self._mtp_stage_idx = 0
 
     def get_batch_size(self, step: int) -> int:
@@ -259,48 +261,35 @@ class TrainingManager:
         ws = self.get_window_size(step)
         return torch.tensor(ws * block_size // block_size, dtype=torch.int32, device="cuda")
 
-    def get_mtp_weights(self, step: int) -> Tensor | None:
-        """Get MTP weight tensor for current step, or None if MTP is disabled."""
-        if not self.mtp_enabled:
+    def get_mtp_weights_list(self, step: int) -> list[float] | None:
+        """Get MTP weights as a Python list for current step, or None if disabled."""
+        if not self.mtp_enabled or not self._mtp_schedule:
             return None
 
-        schedule = self.mtp_config.get("schedule", [])
-        transitions = self.mtp_config.get("transitions", [])
-        if not schedule:
-            return None
-
-        progress = step / self.num_scheduled_iterations
-
-        # Determine current stage
-        stage_idx = len(transitions)  # default to last stage
-        for i, trans in enumerate(transitions):
-            if progress < trans:
-                stage_idx = i
-                break
-
-        stage = schedule[min(stage_idx, len(schedule) - 1)]
+        stage_idx = self._mtp_stage_idx
+        stage = self._mtp_schedule[min(stage_idx, len(self._mtp_schedule) - 1)]
         weights_start = stage["mtp_weights_start"]
         weights_end = stage["mtp_weights_end"]
 
         # Compute linear interpolation within the stage
-        if stage_idx == 0:
-            stage_start_frac = 0.0
-        else:
-            stage_start_frac = transitions[stage_idx - 1]
-
-        if stage_idx < len(transitions):
-            stage_end_frac = transitions[stage_idx]
-        else:
-            stage_end_frac = 1.0
+        transitions = self._mtp_transitions
+        stage_start_frac = transitions[stage_idx - 1] if stage_idx > 0 else 0.0
+        stage_end_frac = transitions[stage_idx] if stage_idx < len(transitions) else 1.0
 
         stage_len = stage_end_frac - stage_start_frac
         if stage_len > 0:
-            t = (progress - stage_start_frac) / stage_len
-            t = max(0.0, min(1.0, t))
+            progress = step / self.num_scheduled_iterations
+            t = max(0.0, min(1.0, (progress - stage_start_frac) / stage_len))
         else:
             t = 1.0
 
-        weights = [s + t * (e - s) for s, e in zip(weights_start, weights_end)]
+        return [s + t * (e - s) for s, e in zip(weights_start, weights_end)]
+
+    def get_mtp_weights(self, step: int) -> Tensor | None:
+        """Get MTP weight tensor for current step, or None if MTP is disabled."""
+        weights = self.get_mtp_weights_list(step)
+        if weights is None:
+            return None
         return torch.tensor(weights, device="cuda", dtype=torch.float32)
 
     def advance_schedule(self, step: int):
@@ -351,16 +340,13 @@ class TrainingManager:
 
         # Check for MTP stage transitions
         if self.mtp_enabled:
-            mtp_transitions = self.mtp_config.get("transitions", [])
-            mtp_schedule = self.mtp_config.get("schedule", [])
-            progress = step / self.num_scheduled_iterations
-            new_mtp_stage = len(mtp_transitions)
-            for i, trans in enumerate(mtp_transitions):
+            new_mtp_stage = len(self._mtp_transitions)
+            for i, trans in enumerate(self._mtp_transitions):
                 if progress < trans:
                     new_mtp_stage = i
                     break
             if new_mtp_stage != self._mtp_stage_idx:
-                stage = mtp_schedule[min(new_mtp_stage, len(mtp_schedule) - 1)]
+                stage = self._mtp_schedule[min(new_mtp_stage, len(self._mtp_schedule) - 1)]
                 num_offsets = len(stage["mtp_weights_start"])
                 self.print_fn(
                     f"Step {step}: MTP stage transition {self._mtp_stage_idx} -> {new_mtp_stage} "
@@ -1542,9 +1528,9 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                 ),
             }
 
-            # MTP metrics
+            # MTP metrics (use Python-side weights to avoid CUDA sync from .tolist())
             if mtp_weights is not None:
-                mtp_w = mtp_weights.tolist()
+                mtp_w = training_manager.get_mtp_weights_list(step)
                 log_dict["mtp_num_offsets"] = len(mtp_w)
                 for i, w in enumerate(mtp_w):
                     log_dict[f"mtp_weight_{i}"] = w
