@@ -13,8 +13,10 @@ from einops.layers.torch import Rearrange, Reduce
 
 from mlps import (
     LowRankLinear,
+    NobleLinear,
     create_mlp as _create_mlp,
     _get_activation_spec,
+    _resolve_low_rank_config,
 )
 
 # FlexAttention compatibility import. Not all environments expose this module.
@@ -33,28 +35,6 @@ else:
 
 def _get_flex_attention():
     return _compiled_flex_attention or flex_attention
-
-
-def _resolve_low_rank_config(low_rank_config: dict | None) -> dict:
-    if low_rank_config is None or not isinstance(low_rank_config, dict):
-        return {
-            "enabled": False,
-            "rank_ratio": 0.25,
-            "rank": None,
-            "min_rank": 1,
-            "max_rank": None,
-            "apply_attention": True,
-            "apply_mlp": True,
-        }
-    return {
-        "enabled": bool(low_rank_config.get("enabled", False)),
-        "rank_ratio": float(low_rank_config.get("rank_ratio", 0.25)),
-        "rank": low_rank_config.get("rank"),
-        "min_rank": low_rank_config.get("min_rank", 1),
-        "max_rank": low_rank_config.get("max_rank", None),
-        "apply_attention": bool(low_rank_config.get("apply_attention", True)),
-        "apply_mlp": bool(low_rank_config.get("apply_mlp", True)),
-    }
 
 # -----------------------------------------------------------------------------
 # FlexAttention kernel options for different GPU architectures
@@ -1279,6 +1259,10 @@ class CausalSelfAttention(nn.Module):
         self.value_embed_gate_scale = value_embed_gate_scale
         hdim = num_heads * head_dim
         low_rank_config = _resolve_low_rank_config(low_rank_config)
+        self.low_rank_mode = low_rank_config["mode"]
+        self.use_low_rank = low_rank_config["enabled"] and low_rank_config["apply_attention"]
+        self.use_factorized = self.use_low_rank and self.low_rank_mode == "factorized"
+        self.use_noble = self.use_low_rank and self.low_rank_mode == "noble"
 
         assert hdim == dim, "num_heads * head_dim must equal model_dim"
         std = dim**-0.5
@@ -1288,7 +1272,7 @@ class CausalSelfAttention(nn.Module):
 
         # Merged QKVO weights (from train_gpt.py)
         # Layout: [Q, K, V, O] each of size (dim, hdim)
-        if low_rank_config["enabled"] and low_rank_config["apply_attention"]:
+        if self.use_factorized:
             self.qkvo_w = LowRankLinear(
                 in_features=hdim,
                 out_features=dim * 4,
@@ -1308,9 +1292,42 @@ class CausalSelfAttention(nn.Module):
         else:
             self.qkvo_w = nn.Parameter(torch.empty(dim * 4, hdim))
             self.qkvo_w.label = "attn"
+            self.qkvo_w.lr_mul = 1.0
+            self.qkvo_w.wd_mul = 1.0
             with torch.no_grad():
-                self.qkvo_w[: dim * 3].uniform_(-bound, bound)  # init QKV weights
+                qkv_bound = 0.5 * bound if self.use_noble else bound
+                self.qkvo_w[: dim * 3].uniform_(-qkv_bound, qkv_bound)  # init QKV weights
                 self.qkvo_w[dim * 3 :].zero_()  # init O weights to zero
+
+        if self.use_noble:
+            noble_kwargs = dict(
+                rank_ratio=low_rank_config["rank_ratio"],
+                rank=low_rank_config["rank"],
+                min_rank=low_rank_config["min_rank"],
+                max_rank=low_rank_config["max_rank"],
+                label="attn",
+                up_init_alpha=low_rank_config["noble_up_init_alpha"],
+                lr_power=low_rank_config["noble_lr_power"],
+                mix_lr_power=low_rank_config["noble_mix_lr_power"],
+                freq_lr_mul=low_rank_config["noble_freq_lr_mul"],
+                phase_lr_mul=low_rank_config["noble_phase_lr_mul"],
+                freq_min=low_rank_config["noble_freq_min"],
+                freq_max=low_rank_config["noble_freq_max"],
+                phase_std=low_rank_config["noble_phase_std"],
+            )
+            self.qkv_noble = NobleLinear(
+                in_features=hdim,
+                out_features=dim * 3,
+                **noble_kwargs,
+            )
+            self.o_noble = NobleLinear(
+                in_features=hdim,
+                out_features=dim,
+                **noble_kwargs,
+            )
+        else:
+            self.qkv_noble = None
+            self.o_noble = None
 
         # Sparse gated attention (from train_gpt.py @classiclarryd)
         gate_input_dim = gating_config["gate_input_dim"]
@@ -1326,6 +1343,28 @@ class CausalSelfAttention(nn.Module):
             self.value_embed_gate.weight.label = "value_embed_gate"
         else:
             self.value_embed_gate = None
+
+    def _project_qkv(self, x: Tensor, sa_lambda: Tensor):
+        if self.use_factorized:
+            qkv = self.qkvo_w(x)[:, :, : self.dim * 3]
+            return sa_lambda * qkv
+
+        qkv = F.linear(x, self.qkvo_w[: self.dim * 3].type_as(x))
+        if self.qkv_noble is not None:
+            qkv = qkv + self.qkv_noble(x)
+        return sa_lambda * qkv
+
+    def _project_o(self, x: Tensor, sa_lambda: Tensor):
+        if self.use_factorized:
+            o_A = self.qkvo_w.A[self.dim * 3 :, :].type_as(x)
+            y = F.linear(x, self.qkvo_w.B.type_as(x))
+            y = F.linear(y, o_A)
+            return sa_lambda * y
+
+        y = F.linear(x, self.qkvo_w[self.dim * 3 :].type_as(x))
+        if self.o_noble is not None:
+            y = y + self.o_noble(x)
+        return sa_lambda * y
 
     def forward(
         self,
@@ -1343,16 +1382,8 @@ class CausalSelfAttention(nn.Module):
     ):
         B, T = x.size(0), x.size(1)
         # Apply sa_lambdas[0] to QKV weights (from train_gpt.py)
-        if isinstance(self.qkvo_w, LowRankLinear):
-            qkv = sa_lambdas[0] * self.qkvo_w(x)
-            qkv = qkv[:, :, : self.dim * 3]
-            q, k, v = qkv.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        else:
-            q, k, v = (
-                F.linear(x, sa_lambdas[0] * self.qkvo_w[: self.dim * 3].type_as(x))
-                .view(B, T, 3 * self.num_heads, self.head_dim)
-                .chunk(3, dim=-2)
-            )
+        qkv = self._project_qkv(x, sa_lambdas[0])
+        q, k, v = qkv.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
 
         # QK norm and RoPE
         q, k = norm(q), norm(k)  # QK norm @Grad62304977
@@ -1414,15 +1445,7 @@ class CausalSelfAttention(nn.Module):
             y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
 
             # Output projection using merged weights with sa_lambdas[1]
-            if isinstance(self.qkvo_w, LowRankLinear):
-                o_A = self.qkvo_w.A[self.dim * 3 :, :].type_as(y)
-                y = F.linear(y, self.qkvo_w.B.type_as(y))
-                y = F.linear(y, o_A)
-            else:
-                o_weight = self.qkvo_w[self.dim * 3 :].type_as(y)
-                y = F.linear(y, sa_lambdas[1] * o_weight)
-            if isinstance(self.qkvo_w, LowRankLinear):
-                y = sa_lambdas[1] * y
+            y = self._project_o(y, sa_lambdas[1])
 
             kv_cache["k"] = cat_k
             kv_cache["v"] = cat_v
@@ -1455,15 +1478,7 @@ class CausalSelfAttention(nn.Module):
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
 
         # Output projection using merged weights with sa_lambdas[1]
-        if isinstance(self.qkvo_w, LowRankLinear):
-            o_A = self.qkvo_w.A[self.dim * 3 :, :].type_as(y)
-            y = F.linear(y, self.qkvo_w.B.type_as(y))
-            y = F.linear(y, o_A)
-        else:
-            o_weight = self.qkvo_w[self.dim * 3 :].type_as(y)
-            y = F.linear(y, sa_lambdas[1] * o_weight)
-        if isinstance(self.qkvo_w, LowRankLinear):
-            y = sa_lambdas[1] * y
+        y = self._project_o(y, sa_lambdas[1])
 
         if kv_cache is not None and kv_cache.get("k") is None:
             kv_cache["k"] = k

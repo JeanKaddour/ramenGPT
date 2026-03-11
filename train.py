@@ -14,6 +14,7 @@ from torch import Tensor, nn
 import torch.nn.utils as nn_utils
 import tiktoken
 
+from mlps import _resolve_low_rank_config
 from model import GPT, next_multiple_of_n, set_flex_attention_kernel_options
 from optimizers import create_optimizer
 from inference import run_validation_generation
@@ -597,7 +598,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     lambda_config = getattr(config, "lambda_config", None)
     lr_multipliers = optimizer_config.get("lr_multipliers", {})
     wd_multipliers = optimizer_config.get("wd_multipliers", {})
-    low_rank_config = getattr(config, "low_rank_config", None)
+    low_rank_config = _resolve_low_rank_config(getattr(config, "low_rank_config", None))
     residual_connection_config = getattr(config, "residual_connection_config", None)
     validation_inference = getattr(config, "validation_inference", {})
     if not isinstance(validation_inference, dict):
@@ -648,6 +649,20 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         residual_connection_config = residual_connection_config or {}
         residual_connection_config["num_streams"] = args.residual_connection_num_streams
         print(f"Override: residual_connection.num_streams = {args.residual_connection_num_streams}")
+
+    low_rank_enabled = bool(low_rank_config.get("enabled", False))
+    low_rank_mode = low_rank_config.get("mode", "factorized")
+    if low_rank_enabled and low_rank_mode == "noble":
+        if optimizer_config.get("matrix_optimizer", "muon") == "spectron":
+            raise ValueError(
+                "low_rank_config.mode='noble' does not support matrix_optimizer='spectron'. "
+                "Use muon, aro, bam, lite, or disable Noble mode."
+            )
+        if low_rank_config.get("apply_mlp", True) and model_config.get("mlp_type", "default") != "default":
+            raise ValueError(
+                "Noble MLP support is only implemented for mlp_type='default'. "
+                "Set low_rank_config.apply_mlp=False or use the default MLP."
+            )
 
     # Configure model backend features tied to GPU architecture.
     set_flex_attention_kernel_options(detected_gpu_info.get("architecture"))
@@ -780,6 +795,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         residual_num_streams = int(residual_connection_config.get("num_streams", 1))
         residual_num_fracs = int(residual_connection_config.get("num_fracs", 1))
         residual_info = f"res-{residual_connection_mode}-s{residual_num_streams}-f{residual_num_fracs}"
+        low_rank_info = f"lrk-{low_rank_mode if low_rank_enabled else 'none'}"
 
         # Generate automatic run name if not specified
         if logging_config["wandb_run_name"] is None:
@@ -791,7 +807,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             wandb_run_name = (
                 f"{model_type}_{matrix_optimizer_prefix}_"
                 f"{model_size_info}_{param_info}_{seq_len_info}"
-                f"{activation_info}_{batch_info}_{residual_info}"
+                f"{activation_info}_{batch_info}_{residual_info}_{low_rank_info}"
             )
         else:
             wandb_run_name = logging_config["wandb_run_name"]
@@ -805,7 +821,10 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             f"seq_{data_config['train_seq_len']}",  # Sequence length
             f"params_{param_info}",  # Total parameters in human-readable format
             f"act_{activation_short}",  # Activation function
+            f"lowrank_{low_rank_mode if low_rank_enabled else 'none'}",
         ]
+        if low_rank_enabled and low_rank_mode == "noble":
+            tags.append("noble")
 
         # Add optimizer info to tags
         if optimizer2 is not None:
@@ -833,6 +852,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             "activation": activation_name,  # Explicitly track activation function
             "residual_connection_config": residual_connection_config or {},
             "validation_inference_enabled": run_validation_text_inference,
+            "low_rank_mode": low_rank_mode if low_rank_enabled else "none",
         }
 
         wandb.init(

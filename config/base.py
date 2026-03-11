@@ -225,12 +225,21 @@ optimizer_config = dict(
 
 low_rank_config = dict(
     enabled=False,
+    mode="factorized",
     rank_ratio=0.25,
     rank=None,
     min_rank=1,
     max_rank=None,
     apply_attention=True,
     apply_mlp=True,
+    noble_up_init_alpha=0.01,
+    noble_lr_power=0.3,
+    noble_mix_lr_power=0.45,
+    noble_freq_lr_mul=3.0,
+    noble_phase_lr_mul=5.0,
+    noble_freq_min=0.8,
+    noble_freq_max=1.2,
+    noble_phase_std=0.1,
 )
 
 # FlexAttention setup

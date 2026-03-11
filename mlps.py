@@ -13,6 +13,7 @@ Factory: create_mlp(mlp_type, dim, c_proj_lr_mul, std_scale, activation, ffn_dim
 from __future__ import annotations
 
 from functools import partial
+import math
 
 import torch
 from torch import Tensor, nn
@@ -51,6 +52,22 @@ def _infer_low_rank_rank(in_features, rank_ratio=0.25, rank=None, min_rank=1, ma
         inferred_rank = min(inferred_rank, int(max_rank))
 
     return min(inferred_rank, int(in_features))
+
+
+def _set_param_metadata(
+    param: nn.Parameter,
+    *,
+    label: str | None,
+    lr_mul: float = 1.0,
+    wd_mul: float = 1.0,
+    aro_transpose: bool | None = None,
+):
+    if label is not None:
+        param.label = label
+    param.lr_mul = lr_mul
+    param.wd_mul = wd_mul
+    if aro_transpose is not None:
+        param.aro_transpose = aro_transpose
 
 
 class LowRankLinear(nn.Module):
@@ -96,13 +113,8 @@ class LowRankLinear(nn.Module):
             self.A.normal_(0.0, init_std)
             self.B.normal_(0.0, init_std)
 
-        if label is not None:
-            self.A.label = label
-            self.B.label = label
-        self.A.lr_mul = lr_mul
-        self.B.lr_mul = lr_mul
-        self.A.wd_mul = wd_mul
-        self.B.wd_mul = wd_mul
+        _set_param_metadata(self.A, label=label, lr_mul=lr_mul, wd_mul=wd_mul)
+        _set_param_metadata(self.B, label=label, lr_mul=lr_mul, wd_mul=wd_mul)
 
     def materialize(self):
         return self.A.float().matmul(self.B.float()).to(dtype=self.A.dtype)
@@ -115,24 +127,166 @@ class LowRankLinear(nn.Module):
         return F.linear(F.linear(x, self.B.type_as(x)), self.A.type_as(x))
 
 
+class NobleLinear(nn.Module):
+    """CosNet low-rank branch from NOBLE.
+
+    Computes an additive branch:
+        W_up(cos(omega_2 * (M cos(omega_1 * (W_down x) + phi_1)) + phi_2))
+    """
+
+    _is_noble_linear = True
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank_ratio: float = 0.25,
+        rank: int | None = None,
+        min_rank: int | None = 1,
+        max_rank: int | None = None,
+        label: str | None = None,
+        up_init_alpha: float = 0.01,
+        lr_power: float = 0.3,
+        mix_lr_power: float = 0.45,
+        freq_lr_mul: float = 3.0,
+        phase_lr_mul: float = 5.0,
+        freq_min: float = 0.8,
+        freq_max: float = 1.2,
+        phase_std: float = 0.1,
+        wd_mul: float = 1.0,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        rank_base_dim = min(in_features, out_features)
+        self.rank = _infer_low_rank_rank(
+            in_features=rank_base_dim,
+            rank_ratio=rank_ratio,
+            rank=rank,
+            min_rank=min_rank,
+            max_rank=max_rank,
+        )
+        lr_base_ratio = max(1.0, rank_base_dim / max(1, self.rank))
+        up_lr_mul = lr_base_ratio ** (2 * lr_power)
+        mix_lr_mul = lr_base_ratio**mix_lr_power
+
+        self.W_down = nn.Parameter(torch.empty(self.rank, in_features))
+        self.M = nn.Parameter(torch.empty(self.rank, self.rank))
+        self.W_up = nn.Parameter(torch.empty(out_features, self.rank))
+        self.omega_1 = nn.Parameter(torch.empty(self.rank))
+        self.phi_1 = nn.Parameter(torch.empty(self.rank))
+        self.omega_2 = nn.Parameter(torch.empty(self.rank))
+        self.phi_2 = nn.Parameter(torch.empty(self.rank))
+
+        down_init_std = 1.0 / math.sqrt(max(1, in_features))
+        up_init_std = up_init_alpha / math.sqrt(max(1, self.rank))
+        with torch.no_grad():
+            self.W_down.normal_(0.0, down_init_std)
+            nn.init.xavier_uniform_(self.M)
+            self.W_up.normal_(0.0, up_init_std)
+            self.omega_1.uniform_(freq_min, freq_max)
+            self.omega_2.uniform_(freq_min, freq_max)
+            self.phi_1.normal_(0.0, phase_std)
+            self.phi_2.normal_(0.0, phase_std)
+
+        _set_param_metadata(
+            self.W_down,
+            label=label,
+            lr_mul=1.0,
+            wd_mul=wd_mul,
+            aro_transpose=True,
+        )
+        _set_param_metadata(
+            self.M,
+            label=label,
+            lr_mul=mix_lr_mul,
+            wd_mul=wd_mul,
+            aro_transpose=False,
+        )
+        _set_param_metadata(
+            self.W_up,
+            label=label,
+            lr_mul=up_lr_mul,
+            wd_mul=wd_mul,
+            aro_transpose=False,
+        )
+        _set_param_metadata(
+            self.omega_1,
+            label=f"{label}_noble_freq" if label is not None else None,
+            lr_mul=freq_lr_mul,
+            wd_mul=0.0,
+        )
+        _set_param_metadata(
+            self.omega_2,
+            label=f"{label}_noble_freq" if label is not None else None,
+            lr_mul=freq_lr_mul,
+            wd_mul=0.0,
+        )
+        _set_param_metadata(
+            self.phi_1,
+            label=f"{label}_noble_phase" if label is not None else None,
+            lr_mul=phase_lr_mul,
+            wd_mul=0.0,
+        )
+        _set_param_metadata(
+            self.phi_2,
+            label=f"{label}_noble_phase" if label is not None else None,
+            lr_mul=phase_lr_mul,
+            wd_mul=0.0,
+        )
+
+    def forward(self, x: Tensor):
+        x = F.linear(x, self.W_down.type_as(x))
+        x = torch.cos(x * self.omega_1.type_as(x) + self.phi_1.type_as(x))
+        x = F.linear(x, self.M.type_as(x))
+        x = torch.cos(x * self.omega_2.type_as(x) + self.phi_2.type_as(x))
+        return F.linear(x, self.W_up.type_as(x))
+
+
 def _resolve_low_rank_config(low_rank_config: dict | None) -> dict:
     if low_rank_config is None or not isinstance(low_rank_config, dict):
         return {
             "enabled": False,
+            "mode": "factorized",
             "rank_ratio": 0.25,
             "rank": None,
             "min_rank": 1,
             "max_rank": None,
+            "apply_attention": True,
             "apply_mlp": True,
+            "noble_up_init_alpha": 0.01,
+            "noble_lr_power": 0.3,
+            "noble_mix_lr_power": 0.45,
+            "noble_freq_lr_mul": 3.0,
+            "noble_phase_lr_mul": 5.0,
+            "noble_freq_min": 0.8,
+            "noble_freq_max": 1.2,
+            "noble_phase_std": 0.1,
         }
-    return {
+    resolved = {
         "enabled": bool(low_rank_config.get("enabled", False)),
+        "mode": str(low_rank_config.get("mode", "factorized")).lower(),
         "rank_ratio": float(low_rank_config.get("rank_ratio", 0.25)),
         "rank": low_rank_config.get("rank"),
         "min_rank": low_rank_config.get("min_rank", 1),
         "max_rank": low_rank_config.get("max_rank", None),
+        "apply_attention": bool(low_rank_config.get("apply_attention", True)),
         "apply_mlp": bool(low_rank_config.get("apply_mlp", True)),
+        "noble_up_init_alpha": float(low_rank_config.get("noble_up_init_alpha", 0.01)),
+        "noble_lr_power": float(low_rank_config.get("noble_lr_power", 0.3)),
+        "noble_mix_lr_power": float(low_rank_config.get("noble_mix_lr_power", 0.45)),
+        "noble_freq_lr_mul": float(low_rank_config.get("noble_freq_lr_mul", 3.0)),
+        "noble_phase_lr_mul": float(low_rank_config.get("noble_phase_lr_mul", 5.0)),
+        "noble_freq_min": float(low_rank_config.get("noble_freq_min", 0.8)),
+        "noble_freq_max": float(low_rank_config.get("noble_freq_max", 1.2)),
+        "noble_phase_std": float(low_rank_config.get("noble_phase_std", 0.1)),
     }
+    if resolved["mode"] not in {"factorized", "noble"}:
+        raise ValueError(
+            f"Unsupported low_rank_config.mode={resolved['mode']!r}. "
+            "Expected 'factorized' or 'noble'."
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -435,9 +589,12 @@ class DefaultMLP(nn.Module):
         super().__init__()
 
         self.low_rank_config = _resolve_low_rank_config(low_rank_config)
+        self.low_rank_mode = self.low_rank_config["mode"]
         self.use_low_rank = self.low_rank_config["enabled"] and self.low_rank_config.get(
             "apply_mlp", True
         )
+        self.use_factorized = self.use_low_rank and self.low_rank_mode == "factorized"
+        self.use_noble = self.use_low_rank and self.low_rank_mode == "noble"
         self.low_rank_pairs: list[tuple[Tensor, Tensor]] = []
 
         self.is_glu, self.activation_fn = _get_activation_spec(activation)
@@ -449,7 +606,7 @@ class DefaultMLP(nn.Module):
         else:
             c_fc_dim = ffn_dim
 
-        if self.use_low_rank:
+        if self.use_factorized:
             self.c_fc = LowRankLinear(
                 in_features=dim,
                 out_features=c_fc_dim,
@@ -477,16 +634,59 @@ class DefaultMLP(nn.Module):
             self.c_fc = nn.Parameter(torch.empty(c_fc_dim, dim))
             self.c_proj = nn.Parameter(torch.empty(ffn_dim, dim))
             self.c_fc.label = "mlp"
+            self.c_fc.lr_mul = 1.0
             self.c_fc.aro_transpose = True  # input-side
             self.c_proj.label = "mlp"
             self.c_proj.lr_mul = c_proj_lr_mul
             self.c_proj.aro_transpose = False  # output-side
+            self.c_fc.wd_mul = 1.0
+            self.c_proj.wd_mul = 1.0
+
+        if self.use_noble:
+            self.c_fc_noble = NobleLinear(
+                in_features=dim,
+                out_features=c_fc_dim,
+                rank_ratio=self.low_rank_config["rank_ratio"],
+                rank=self.low_rank_config["rank"],
+                min_rank=self.low_rank_config["min_rank"],
+                max_rank=self.low_rank_config["max_rank"],
+                label="mlp",
+                up_init_alpha=self.low_rank_config["noble_up_init_alpha"],
+                lr_power=self.low_rank_config["noble_lr_power"],
+                mix_lr_power=self.low_rank_config["noble_mix_lr_power"],
+                freq_lr_mul=self.low_rank_config["noble_freq_lr_mul"],
+                phase_lr_mul=self.low_rank_config["noble_phase_lr_mul"],
+                freq_min=self.low_rank_config["noble_freq_min"],
+                freq_max=self.low_rank_config["noble_freq_max"],
+                phase_std=self.low_rank_config["noble_phase_std"],
+            )
+            self.c_proj_noble = NobleLinear(
+                in_features=ffn_dim,
+                out_features=dim,
+                rank_ratio=self.low_rank_config["rank_ratio"],
+                rank=self.low_rank_config["rank"],
+                min_rank=self.low_rank_config["min_rank"],
+                max_rank=self.low_rank_config["max_rank"],
+                label="mlp",
+                up_init_alpha=self.low_rank_config["noble_up_init_alpha"],
+                lr_power=self.low_rank_config["noble_lr_power"],
+                mix_lr_power=self.low_rank_config["noble_mix_lr_power"],
+                freq_lr_mul=self.low_rank_config["noble_freq_lr_mul"],
+                phase_lr_mul=self.low_rank_config["noble_phase_lr_mul"],
+                freq_min=self.low_rank_config["noble_freq_min"],
+                freq_max=self.low_rank_config["noble_freq_max"],
+                phase_std=self.low_rank_config["noble_phase_std"],
+            )
+            self.c_proj_noble.W_up.lr_mul *= c_proj_lr_mul
+        else:
+            self.c_fc_noble = None
+            self.c_proj_noble = None
         self.ffn_dim = ffn_dim
 
         std = std_scale * (dim**-0.5)
         bound = (3**0.5) * std
         with torch.no_grad():
-            if self.use_low_rank:
+            if self.use_factorized:
                 # Scale the low-rank factors with the existing MLP width-aware variance.
                 self.c_fc.A.uniform_(-bound, bound)
                 self.c_fc.B.uniform_(-bound, bound)
@@ -498,19 +698,25 @@ class DefaultMLP(nn.Module):
                 self.c_proj.zero_()
 
     def forward(self, x: Tensor):
-        if self.use_low_rank:
-            x = self.c_fc(x)
+        fc_input = x
+        if self.use_factorized:
+            x = self.c_fc(fc_input)
         else:
-            x = F.linear(x, self.c_fc.type_as(x))
+            x = F.linear(fc_input, self.c_fc.type_as(fc_input))
+            if self.c_fc_noble is not None:
+                x = x + self.c_fc_noble(fc_input)
         if self.is_glu:
             x_gate, x_sig = x.chunk(2, dim=-1)
             x = self.activation_fn(x_gate) * x_sig
         else:
             x = self.activation_fn(x)
-        if self.use_low_rank:
-            x = self.c_proj(x)
+        proj_input = x
+        if self.use_factorized:
+            x = self.c_proj(proj_input)
         else:
-            x = F.linear(x, self.c_proj.T.type_as(x))
+            x = F.linear(proj_input, self.c_proj.T.type_as(proj_input))
+            if self.c_proj_noble is not None:
+                x = x + self.c_proj_noble(proj_input)
         return x
 
 
