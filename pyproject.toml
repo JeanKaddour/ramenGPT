@@ -18,6 +18,7 @@ dependencies = [
     "einops",
     "setuptools",
     "wandb",
+    "modal",
 ]
 
 [tool.setuptools]
