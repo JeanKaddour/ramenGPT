@@ -613,6 +613,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     skip_config = getattr(config, "skip_config", None)
     rope_config = getattr(config, "rope_config", None)
     embed_config = getattr(config, "embed_config", None)
+    canon_config = getattr(config, "canon_config", None)
     window_schedule_config = getattr(config, "window_schedule_config", None)
 
     # Extract gradient clipping configuration from training config
@@ -686,6 +687,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         skip_config=skip_config,
         rope_config=rope_config,
         embed_config=embed_config,
+        canon_config=canon_config,
         residual_connection_config=residual_connection_config,
         wd_multipliers=wd_multipliers,
         low_rank_config=low_rank_config,
@@ -707,6 +709,16 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         "mtp_config": mtp_config or {},
     }
     training_manager = TrainingManager(model, training_manager_config, print_fn=print)
+
+    # CLI overrides for muon_split / decorrelate / mlp_split
+    muon_cfg = optimizer_config.get("muon", {})
+    if getattr(args, "muon_split", False):
+        muon_cfg["muon_split"] = True
+    if getattr(args, "muon_decorrelate", False):
+        muon_cfg["muon_decorrelate"] = True
+    if getattr(args, "mlp_split_groups", None) is not None:
+        muon_cfg["mlp_split_groups"] = args.mlp_split_groups
+    optimizer_config["muon"] = muon_cfg
 
     # Setup optimizers based on configuration
     optimizer_state = create_optimizer(model, optimizer_config, print_fn=print)
@@ -840,6 +852,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             **batch_schedule_config,
             **validation_inference_config,
             "low_rank_config": low_rank_config or {},
+            "canon_config": canon_config or {},
             "config_file": args.config,
             "batch_size_multiple": micro_batch_size,
             "micro_batch_size": micro_batch_size,

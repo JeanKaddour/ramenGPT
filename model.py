@@ -1,5 +1,6 @@
 import itertools
 import math
+from dataclasses import dataclass
 from functools import partial
 from random import randrange
 from typing import Callable
@@ -18,6 +19,11 @@ from mlps import (
     _get_activation_spec,
     _resolve_low_rank_config,
 )
+
+try:
+    from causal_conv1d import causal_conv1d_fn
+except ImportError:  # pragma: no cover
+    causal_conv1d_fn = None
 
 # FlexAttention compatibility import. Not all environments expose this module.
 try:
@@ -88,6 +94,143 @@ def identity(t):
 
 def add(x, y):
     return x + y
+
+
+def _set_param_metadata(param: nn.Parameter, label: str, *, lr_mul: float = 1.0, wd_mul: float = 0.0):
+    param.label = label
+    param.lr_mul = lr_mul
+    param.wd_mul = wd_mul
+    return param
+
+
+@dataclass(frozen=True)
+class CanonSettings:
+    enabled: bool = False
+    set: str = "ABCD"
+    first_n: int = 0
+    last_n: int = 0
+    layers: tuple[int, ...] = ()
+    xsa_last_n: int = 0
+    xsa_learnable_gate: bool = False
+    xsa_gate_init: float = 2.0
+    boundary_delta_enabled: bool = False
+    boundary_delta_first_n: int = 0
+    boundary_delta_gate_vector: bool = False
+    boundary_delta_gate_init: float = -4.0
+    use_resid_mix: bool = False
+    smear_mode: str = "ramen"
+    skip_topology: str = "ramen"
+    bigram_vocab_size: int = 0
+    bigram_dim: int = 0
+    kernel: int = 4
+    bias: bool = False
+    activation: bool = False
+    residual: bool = True
+    delta_gate: bool = False
+    delta_gate_init: float = -4.0
+    use_fast_conv1d: bool = True
+
+    @classmethod
+    def from_config(cls, canon_config: dict | None, *, num_layers: int) -> "CanonSettings":
+        canon_config = canon_config or {}
+        layers = tuple(
+            int(layer) for layer in canon_config.get("layers", ()) if str(layer).strip()
+        )
+        layers = tuple(dict.fromkeys(layers))
+        first_n = int(canon_config.get("first_n", 0))
+        last_n = int(canon_config.get("last_n", 0))
+        boundary_delta_first_n = int(canon_config.get("boundary_delta_first_n", 0))
+        smear_mode = str(canon_config.get("smear_mode", "ramen")).lower()
+        skip_topology = str(canon_config.get("skip_topology", "ramen")).lower()
+
+        if smear_mode not in {"ramen", "canon_vector"}:
+            raise ValueError("canon_config.smear_mode must be 'ramen' or 'canon_vector'")
+        if skip_topology not in {"ramen", "canon_unet"}:
+            raise ValueError("canon_config.skip_topology must be 'ramen' or 'canon_unet'")
+        if first_n < 0 or last_n < 0:
+            raise ValueError("canon_config.first_n and canon_config.last_n must be >= 0")
+        if first_n > num_layers or last_n > num_layers:
+            raise ValueError("canon_config.first_n/last_n cannot exceed model_config.num_layers")
+        if boundary_delta_first_n < 0 or boundary_delta_first_n > num_layers:
+            raise ValueError(
+                "canon_config.boundary_delta_first_n must be between 0 and model_config.num_layers"
+            )
+        if any(layer < 1 or layer > num_layers for layer in layers):
+            raise ValueError(
+                f"canon_config.layers must use 1-based indices within [1, {num_layers}], got {layers}"
+            )
+
+        enabled = bool(canon_config.get("enabled", False))
+        return cls(
+            enabled=enabled,
+            set=str(canon_config.get("set", "ABCD")).upper(),
+            first_n=first_n,
+            last_n=last_n,
+            layers=layers,
+            xsa_last_n=int(canon_config.get("xsa_last_n", 0)),
+            xsa_learnable_gate=bool(canon_config.get("xsa_learnable_gate", False)),
+            xsa_gate_init=float(canon_config.get("xsa_gate_init", 2.0)),
+            boundary_delta_enabled=bool(canon_config.get("boundary_delta_enabled", False)),
+            boundary_delta_first_n=boundary_delta_first_n,
+            boundary_delta_gate_vector=bool(
+                canon_config.get("boundary_delta_gate_vector", False)
+            ),
+            boundary_delta_gate_init=float(
+                canon_config.get("boundary_delta_gate_init", -4.0)
+            ),
+            use_resid_mix=enabled and bool(canon_config.get("use_resid_mix", False)),
+            smear_mode=smear_mode,
+            skip_topology=skip_topology,
+            bigram_vocab_size=int(canon_config.get("bigram_vocab_size", 0)),
+            bigram_dim=int(canon_config.get("bigram_dim", 0)),
+            kernel=int(canon_config.get("kernel", 4)),
+            bias=bool(canon_config.get("bias", False)),
+            activation=bool(canon_config.get("activation", False)),
+            residual=bool(canon_config.get("residual", True)),
+            delta_gate=bool(canon_config.get("delta_gate", False)),
+            delta_gate_init=float(canon_config.get("delta_gate_init", -4.0)),
+            use_fast_conv1d=bool(canon_config.get("use_fast_conv1d", True)),
+        )
+
+    @property
+    def explicit_layers(self) -> frozenset[int]:
+        return frozenset(layer - 1 for layer in self.layers)
+
+    def layer_kwargs(self) -> dict:
+        return dict(
+            kernel=self.kernel,
+            bias=self.bias,
+            activation=self.activation,
+            residual=self.residual,
+            delta_gate=self.delta_gate,
+            delta_gate_init=self.delta_gate_init,
+            use_fast_conv1d=self.use_fast_conv1d,
+        )
+
+    def boundary_delta_gate_shape(self, dim: int) -> tuple[int, ...]:
+        return (dim,) if self.boundary_delta_gate_vector else (1,)
+
+    def use_layer_hooks(self, layer_idx: int, num_layers: int) -> bool:
+        if not self.enabled:
+            return False
+        if self.layers:
+            return layer_idx in self.explicit_layers
+        if self.first_n > 0 or self.last_n > 0:
+            return layer_idx < self.first_n or layer_idx >= num_layers - self.last_n
+        return True
+
+    def layer_set_for(self, layer_idx: int, num_layers: int) -> str:
+        return self.set if self.use_layer_hooks(layer_idx, num_layers) else ""
+
+    def uses_xsa(self, layer_idx: int, num_layers: int) -> bool:
+        return self.enabled and layer_idx >= max(0, num_layers - self.xsa_last_n)
+
+    def uses_boundary_delta(self, layer_idx: int) -> bool:
+        return self.enabled and self.boundary_delta_enabled and layer_idx < self.boundary_delta_first_n
+
+
+def _build_canon_layer(dim: int, canon_settings: CanonSettings) -> "CanonLayer":
+    return CanonLayer(dim, **canon_settings.layer_kwargs())
 
 
 def sinkhorn_log(logits, num_iters=10, tau=0.05):
@@ -1032,14 +1175,21 @@ class AttentionPoolReduceStream(nn.Module):
 def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
     """Apply rotary position embeddings to input tensor"""
     assert cos.size(0) >= x_BTHD.size(-3)
+    rotary_dim = cos.size(-1) * 2
+    assert rotary_dim > 0 and rotary_dim <= x_BTHD.size(-1)
     cos, sin = (
         cos[None, : x_BTHD.size(-3), None, :],
         sin[None, : x_BTHD.size(-3), None, :],
     )
-    x1, x2 = x_BTHD.chunk(2, dim=-1)
+    x_rot = x_BTHD[..., :rotary_dim]
+    x_pass = x_BTHD[..., rotary_dim:]
+    x1, x2 = x_rot.chunk(2, dim=-1)
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
-    return torch.cat((y1, y2), 3)
+    y = torch.cat((y1, y2), 3)
+    if x_pass.numel() == 0:
+        return y
+    return torch.cat((y, x_pass), dim=-1)
 
 
 class PositionalEmbedding(nn.Module):
@@ -1082,14 +1232,14 @@ class YarnPositionalEmbedding(PositionalEmbedding):
 
     def __init__(
         self,
-        head_dim: int,
+        rope_dim: int,
         max_seq_len: int,
         base_freq: float,
         block_size: int,
         initial_attn_scale: float = 0.1,
     ):
         super().__init__()
-        self.head_dim = head_dim
+        self.rope_dim = rope_dim
         self.max_seq_len = max_seq_len
         self.base_freq = base_freq
         self.block_size = block_size
@@ -1100,9 +1250,9 @@ class YarnPositionalEmbedding(PositionalEmbedding):
         """Reset to initial state (called at start of training and after warmup)"""
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
         angular_freq = (1 / self.base_freq) ** torch.linspace(
-            0, 1, steps=self.head_dim // 4, dtype=torch.float32
+            0, 1, steps=self.rope_dim // 4, dtype=torch.float32
         )
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.head_dim // 4)])
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.rope_dim // 4)])
         t = torch.arange(self.max_seq_len, dtype=torch.float32)
         theta = torch.outer(t, angular_freq)
         self.cos = nn.Buffer(theta.cos().to(torch.bfloat16), persistent=False)
@@ -1135,17 +1285,18 @@ class HalfRoPE(PositionalEmbedding):
 
     def __init__(
         self,
-        head_dim: int,
+        rope_dim: int,
         max_seq_len: int,
         base_freq: float = 1024,
         initial_attn_scale: float = 0.1,
     ):
         super().__init__()
+        self.rope_dim = rope_dim
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
         angular_freq = (1 / base_freq) ** torch.linspace(
-            0, 1, steps=head_dim // 4, dtype=torch.float32
+            0, 1, steps=rope_dim // 4, dtype=torch.float32
         )
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(head_dim // 4)])
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(rope_dim // 4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
         theta = torch.outer(t, angular_freq)
         self.cos = nn.Buffer(theta.cos().to(torch.bfloat16), persistent=False)
@@ -1164,14 +1315,15 @@ class StandardRoPE(PositionalEmbedding):
 
     def __init__(
         self,
-        head_dim: int,
+        rope_dim: int,
         max_seq_len: int,
         base_freq: float = 1024,
         initial_attn_scale: float = 0.1,
     ):
         super().__init__()
+        self.rope_dim = rope_dim
         angular_freq = (1 / base_freq) ** torch.linspace(
-            0, 1, steps=head_dim // 2, dtype=torch.float32
+            0, 1, steps=rope_dim // 2, dtype=torch.float32
         )
         t = torch.arange(max_seq_len, dtype=torch.float32)
         theta = torch.outer(t, angular_freq)
@@ -1200,13 +1352,14 @@ class NoPositionalEmbedding(PositionalEmbedding):
       (arXiv:2203.16634)
     """
 
-    def __init__(self, head_dim: int, max_seq_len: int, initial_attn_scale: float = 0.1):
+    def __init__(self, rope_dim: int, max_seq_len: int, initial_attn_scale: float = 0.1):
         super().__init__()
+        self.rope_dim = rope_dim
         self.cos = nn.Buffer(
-            torch.ones(max_seq_len, head_dim // 2, dtype=torch.bfloat16), persistent=False
+            torch.ones(max_seq_len, rope_dim // 2, dtype=torch.bfloat16), persistent=False
         )
         self.sin = nn.Buffer(
-            torch.zeros(max_seq_len, head_dim // 2, dtype=torch.bfloat16), persistent=False
+            torch.zeros(max_seq_len, rope_dim // 2, dtype=torch.bfloat16), persistent=False
         )
         self.attn_scale = initial_attn_scale
 
@@ -1222,20 +1375,122 @@ def create_positional_embedding(rope_config: dict, head_dim: int, max_seq_len: i
     rope_type = rope_config.get("type", "yarn")
     base_freq = rope_config.get("base_freq", 1024)
     initial_attn_scale = rope_config.get("initial_attn_scale", 0.1)
+    rope_dim = int(rope_config.get("rope_dims", 0) or head_dim)
+    if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2 != 0:
+        raise ValueError(
+            f"rope_config.rope_dims must be 0 or an even integer in [2, {head_dim}], got {rope_dim}"
+        )
+    if rope_type in {"yarn", "half_rope"} and rope_dim % 4 != 0:
+        raise ValueError(f"rope_config.rope_dims must be divisible by 4 for rope type {rope_type!r}")
 
     if rope_type == "yarn":
         return YarnPositionalEmbedding(
-            head_dim, max_seq_len, base_freq, block_size, initial_attn_scale
+            rope_dim, max_seq_len, base_freq, block_size, initial_attn_scale
         )
     if rope_type == "half_rope":
-        return HalfRoPE(head_dim, max_seq_len, base_freq, initial_attn_scale)
+        return HalfRoPE(rope_dim, max_seq_len, base_freq, initial_attn_scale)
     if rope_type == "rope":
-        return StandardRoPE(head_dim, max_seq_len, base_freq, initial_attn_scale)
+        return StandardRoPE(rope_dim, max_seq_len, base_freq, initial_attn_scale)
     if rope_type in ("none", "nope"):
-        return NoPositionalEmbedding(head_dim, max_seq_len, initial_attn_scale)
+        return NoPositionalEmbedding(rope_dim, max_seq_len, initial_attn_scale)
 
     supported = ["yarn", "half_rope", "rope", "none", "nope"]
     raise ValueError(f"Unsupported rope type: {rope_type!r}. Supported: {', '.join(supported)}")
+
+
+class CanonLayer(nn.Module):
+    """Depthwise causal convolution used for Canon A/B/C/D placements."""
+
+    def __init__(
+        self,
+        dim: int,
+        kernel: int = 4,
+        *,
+        bias: bool = False,
+        activation: bool = False,
+        residual: bool = True,
+        delta_gate: bool = False,
+        delta_gate_init: float = -4.0,
+        use_fast_conv1d: bool = True,
+    ):
+        super().__init__()
+        if kernel <= 0:
+            raise ValueError(f"canon kernel must be positive, got {kernel}")
+        self.kernel = kernel
+        self.activation = activation
+        self.residual = residual
+        self.delta_gate = delta_gate
+        self.use_fast_conv1d = bool(use_fast_conv1d) and causal_conv1d_fn is not None and kernel in (2, 3, 4)
+        self.conv = nn.Conv1d(dim, dim, kernel_size=kernel, groups=dim, bias=bias, padding=kernel - 1)
+        if delta_gate:
+            self.delta_gate_logit = nn.Parameter(torch.tensor(float(delta_gate_init), dtype=torch.float32))
+        else:
+            self.register_parameter("delta_gate_logit", None)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x_conv = x.transpose(1, 2).contiguous()
+        weight = self.conv.weight
+        bias = self.conv.bias
+        if weight.dtype != x.dtype:
+            weight = weight.to(dtype=x.dtype)
+        if bias is not None and bias.dtype != x.dtype:
+            bias = bias.to(dtype=x.dtype)
+        if self.use_fast_conv1d:
+            y = causal_conv1d_fn(
+                x=x_conv,
+                weight=weight.squeeze(1),
+                bias=bias,
+                activation="silu" if self.activation else None,
+            ).transpose(1, 2)
+        else:
+            y = F.conv1d(x_conv, weight, bias, groups=self.conv.groups, padding=self.kernel - 1)
+            y = y[..., : x.size(1)].transpose(1, 2)
+            if self.activation:
+                y = F.silu(y)
+        if self.delta_gate:
+            gate = torch.sigmoid(self.delta_gate_logit.to(dtype=x.dtype))
+            return x + gate * y if self.residual else gate * y
+        return x + y if self.residual else y
+
+
+class VectorSmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor, prev_state: Tensor | None = None) -> Tensor:
+        gate = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        if prev_state is None:
+            x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        else:
+            x_prev = prev_state.view(1, 1, -1)
+        return (1 - gate) * x + gate * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
 
 
 class CausalSelfAttention(nn.Module):
@@ -1243,6 +1498,7 @@ class CausalSelfAttention(nn.Module):
         self,
         dim: int,
         num_heads: int,
+        num_kv_heads: int,
         max_seq_len: int,
         head_dim: int,
         layer_idx: int,
@@ -1250,21 +1506,37 @@ class CausalSelfAttention(nn.Module):
         value_embed_layers: list,
         value_embed_gate_scale: float,
         low_rank_config: dict | None = None,
+        qk_gain_init: float = 1.0,
+        canon_settings: CanonSettings | None = None,
+        use_xsa: bool = False,
+        use_canon_b: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.dim = dim
         self.layer_idx = layer_idx
         self.value_embed_gate_scale = value_embed_gate_scale
+        self.enable_gqa = num_kv_heads != num_heads
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"model_config.num_heads ({num_heads}) must be divisible by model_config.num_kv_heads ({num_kv_heads})"
+            )
         hdim = num_heads * head_dim
+        self.kv_dim = num_kv_heads * head_dim
+        self.qkv_dim = dim + 2 * self.kv_dim
+        self.group_size = num_heads // num_kv_heads
         low_rank_config = _resolve_low_rank_config(low_rank_config)
         self.low_rank_mode = low_rank_config["mode"]
         self.use_low_rank = low_rank_config["enabled"] and low_rank_config["apply_attention"]
         self.use_factorized = self.use_low_rank and self.low_rank_mode == "factorized"
         self.use_noble = self.use_low_rank and self.low_rank_mode == "noble"
+        canon_settings = canon_settings or CanonSettings()
 
         assert hdim == dim, "num_heads * head_dim must equal model_dim"
+        if self.use_low_rank and self.enable_gqa:
+            raise ValueError("GQA is not implemented for low_rank_config.apply_attention=True in model.py")
         std = dim**-0.5
         bound = (3**0.5) * std  # improved init scale by @YouJiacheng
 
@@ -1274,8 +1546,8 @@ class CausalSelfAttention(nn.Module):
         # Layout: [Q, K, V, O] each of size (dim, hdim)
         if self.use_factorized:
             self.qkvo_w = LowRankLinear(
-                in_features=hdim,
-                out_features=dim * 4,
+                in_features=dim,
+                out_features=self.qkv_dim + dim,
                 rank_ratio=low_rank_config["rank_ratio"],
                 rank=low_rank_config["rank"],
                 min_rank=low_rank_config["min_rank"],
@@ -1287,17 +1559,18 @@ class CausalSelfAttention(nn.Module):
             with torch.no_grad():
                 self.qkvo_w.A.uniform_(-bound, bound)
                 self.qkvo_w.B.uniform_(-bound, bound)
-                self.qkvo_w.A[dim * 3 :].zero_()  # init O weights to zero
+                self.qkvo_w.A[self.qkv_dim :].zero_()  # init O weights to zero
             self.low_rank_pairs = [(self.qkvo_w.A, self.qkvo_w.B)]
         else:
-            self.qkvo_w = nn.Parameter(torch.empty(dim * 4, hdim))
+            self.qkvo_w = nn.Parameter(torch.empty(self.qkv_dim + dim, dim))
             self.qkvo_w.label = "attn"
             self.qkvo_w.lr_mul = 1.0
             self.qkvo_w.wd_mul = 1.0
+            self.qkvo_w.muon_split_heads = num_heads  # for per-head orthogonalization
             with torch.no_grad():
                 qkv_bound = 0.5 * bound if self.use_noble else bound
-                self.qkvo_w[: dim * 3].uniform_(-qkv_bound, qkv_bound)  # init QKV weights
-                self.qkvo_w[dim * 3 :].zero_()  # init O weights to zero
+                self.qkvo_w[: self.qkv_dim].uniform_(-qkv_bound, qkv_bound)  # init QKV weights
+                self.qkvo_w[self.qkv_dim :].zero_()  # init O weights to zero
 
         if self.use_noble:
             noble_kwargs = dict(
@@ -1316,18 +1589,23 @@ class CausalSelfAttention(nn.Module):
                 phase_std=low_rank_config["noble_phase_std"],
             )
             self.qkv_noble = NobleLinear(
-                in_features=hdim,
-                out_features=dim * 3,
+                in_features=dim,
+                out_features=self.qkv_dim,
                 **noble_kwargs,
             )
             self.o_noble = NobleLinear(
-                in_features=hdim,
+                in_features=dim,
                 out_features=dim,
                 **noble_kwargs,
             )
         else:
             self.qkv_noble = None
             self.o_noble = None
+
+        self.q_gain = _set_param_metadata(
+            nn.Parameter(torch.full((num_heads,), float(qk_gain_init), dtype=torch.float32)),
+            "q_gain",
+        )
 
         # Sparse gated attention (from train_gpt.py @classiclarryd)
         gate_input_dim = gating_config["gate_input_dim"]
@@ -1339,32 +1617,76 @@ class CausalSelfAttention(nn.Module):
 
         # Value embedding gate (only on specific layers)
         if gating_config.get("use_value_embed_gate", True) and layer_idx in value_embed_layers:
-            self.value_embed_gate = CastedLinear(gate_input_dim, num_heads)
+            self.value_embed_gate = CastedLinear(gate_input_dim, num_kv_heads)
             self.value_embed_gate.weight.label = "value_embed_gate"
         else:
             self.value_embed_gate = None
 
+        self.use_xsa = bool(use_xsa)
+        if self.use_xsa and canon_settings.xsa_learnable_gate:
+            self.xsa_gate = _set_param_metadata(
+                nn.Parameter(torch.tensor(canon_settings.xsa_gate_init, dtype=torch.float32)),
+                "xsa_gate",
+            )
+        else:
+            self.register_parameter("xsa_gate", None)
+
+        if use_canon_b:
+            self.canon_b = _build_canon_layer(self.qkv_dim, canon_settings)
+        else:
+            self.canon_b = None
+
     def _project_qkv(self, x: Tensor, sa_lambda: Tensor):
         if self.use_factorized:
-            qkv = self.qkvo_w(x)[:, :, : self.dim * 3]
+            qkv = self.qkvo_w(x)[:, :, : self.qkv_dim]
             return sa_lambda * qkv
 
-        qkv = F.linear(x, self.qkvo_w[: self.dim * 3].type_as(x))
+        qkv = F.linear(x, self.qkvo_w[: self.qkv_dim].type_as(x))
         if self.qkv_noble is not None:
             qkv = qkv + self.qkv_noble(x)
         return sa_lambda * qkv
 
     def _project_o(self, x: Tensor, sa_lambda: Tensor):
         if self.use_factorized:
-            o_A = self.qkvo_w.A[self.dim * 3 :, :].type_as(x)
+            o_A = self.qkvo_w.A[self.qkv_dim :, :].type_as(x)
             y = F.linear(x, self.qkvo_w.B.type_as(x))
             y = F.linear(y, o_A)
             return sa_lambda * y
 
-        y = F.linear(x, self.qkvo_w[self.dim * 3 :].type_as(x))
+        y = F.linear(x, self.qkvo_w[self.qkv_dim :].type_as(x))
         if self.o_noble is not None:
             y = y + self.o_noble(x)
         return sa_lambda * y
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        bsz, heads, seqlen, head_dim = y.shape
+        y_grouped = y.reshape(bsz, self.num_kv_heads, self.group_size, seqlen, head_dim)
+        v_norm = F.normalize(v, dim=-1).unsqueeze(2)
+        proj = (y_grouped * v_norm).sum(dim=-1, keepdim=True) * v_norm
+        return (y_grouped - proj).reshape(bsz, heads, seqlen, head_dim)
+
+    def _apply_value_embed(self, v: Tensor, ve: Tensor | None, x: Tensor) -> Tensor:
+        if ve is None:
+            return v
+        B, T = x.shape[:2]
+        ve = ve.reshape(B, T, self.num_heads, self.head_dim)
+        if self.enable_gqa:
+            ve = ve.reshape(B, T, self.num_kv_heads, self.group_size, self.head_dim).mean(dim=3)
+        if self.value_embed_gate is not None:
+            ve_gate_out = self.value_embed_gate_scale * torch.sigmoid(
+                self.value_embed_gate(x[..., : self.value_embed_gate.weight.size(-1)])
+            ).reshape(B, T, self.num_kv_heads, 1)
+            return v + ve_gate_out * ve
+        return v + ve
+
+    def _apply_xsa(self, y: Tensor, v: Tensor) -> Tensor:
+        if not self.use_xsa:
+            return y
+        y_xsa = self._xsa_efficient(y, v)
+        if self.xsa_gate is None:
+            return y_xsa
+        alpha = torch.sigmoid(self.xsa_gate.to(dtype=y.dtype))
+        return y + alpha * (y_xsa - y)
 
     def forward(
         self,
@@ -1383,11 +1705,17 @@ class CausalSelfAttention(nn.Module):
         B, T = x.size(0), x.size(1)
         # Apply sa_lambdas[0] to QKV weights (from train_gpt.py)
         qkv = self._project_qkv(x, sa_lambdas[0])
-        q, k, v = qkv.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        if self.canon_b is not None:
+            qkv = self.canon_b(qkv)
+        q, k, v = qkv.split((self.dim, self.kv_dim, self.kv_dim), dim=-1)
+        q = q.view(B, T, self.num_heads, self.head_dim)
+        k = k.view(B, T, self.num_kv_heads, self.head_dim)
+        v = v.view(B, T, self.num_kv_heads, self.head_dim)
 
         # QK norm and RoPE
         q, k = norm(q), norm(k)  # QK norm @Grad62304977
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
 
         # Key offset: shift keys forward for the stationary head dims (from train_gpt.py)
         # Enables 1-layer induction on long attention window layers
@@ -1398,14 +1726,10 @@ class CausalSelfAttention(nn.Module):
             k[:, 1:, :, 3 * self.head_dim // 4 :] = k[:, :-1, :, 3 * self.head_dim // 4 :].clone()
 
         # Value embedding with gating (from train_gpt.py)
-        if ve is not None and self.value_embed_gate is not None:
-            ve_gate_out = self.value_embed_gate_scale * torch.sigmoid(
-                self.value_embed_gate(x[..., : self.value_embed_gate.weight.size(-1)])
-            ).view(B, T, self.num_heads, 1)
-            v = v + ve_gate_out * ve.view_as(v)
-        elif ve is not None:
-            # Fallback to lambda-based mixing if no gate
-            v = v + ve.view_as(v)
+        v = self._apply_value_embed(v, ve, x)
+        q_heads = q.transpose(1, 2)
+        k_heads = k.transpose(1, 2)
+        v_heads = v.transpose(1, 2)
 
         if kv_cache is not None and T == 1 and kv_cache.get("k") is not None:
             cache_k = kv_cache.get("k")
@@ -1414,15 +1738,17 @@ class CausalSelfAttention(nn.Module):
 
             if key_offset and cache_len > 0:
                 prev_k = cache_k[:, :, -1:, :]
-                k[:, :, self.head_dim // 4 : self.head_dim // 2] = prev_k[:, :, :, self.head_dim // 4 : self.head_dim // 2]
-                k[:, :, 3 * self.head_dim // 4 :] = prev_k[:, :, :, 3 * self.head_dim // 4 :]
+                k_heads[:, :, :, self.head_dim // 4 : self.head_dim // 2] = prev_k[
+                    :, :, :, self.head_dim // 4 : self.head_dim // 2
+                ]
+                k_heads[:, :, :, 3 * self.head_dim // 4 :] = prev_k[:, :, :, 3 * self.head_dim // 4 :]
             # Append current token cache to existing prefix.
             if cache_k is None:
-                cat_k = k
-                cat_v = v
+                cat_k = k_heads
+                cat_v = v_heads
             else:
-                cat_k = torch.cat([cache_k, k], dim=2)
-                cat_v = torch.cat([cache_v, v], dim=2)
+                cat_k = torch.cat([cache_k, k_heads], dim=2)
+                cat_v = torch.cat([cache_v, v_heads], dim=2)
 
             # Include current token for self-attention; allow only same-document positions.
             if cache_docs is None:
@@ -1430,19 +1756,31 @@ class CausalSelfAttention(nn.Module):
             current_doc = docs[0]
             full_docs = torch.cat([cache_docs.to(torch.int32), current_doc.view(1)])
             same_doc = full_docs == current_doc
-            allow = same_doc
-            scores = torch.einsum("bthd,bhSd->bthS", q, cat_k) * float(attn_scale)
-            scores = scores.masked_fill(~allow.view(1, 1, 1, -1), float("-inf"))
-            attn = F.softmax(scores, dim=-1)
-            y = torch.einsum("bthS,bhSd->bthd", attn, cat_v)
+            attn_mask = torch.full(
+                (1, 1, 1, cat_k.size(2)),
+                float("-inf"),
+                device=x.device,
+                dtype=q_heads.dtype,
+            )
+            attn_mask.masked_fill_(same_doc.view(1, 1, 1, -1), 0.0)
+            y = F.scaled_dot_product_attention(
+                q_heads,
+                cat_k,
+                cat_v,
+                attn_mask=attn_mask,
+                is_causal=False,
+                scale=float(attn_scale),
+                enable_gqa=self.enable_gqa,
+            )
+            y = self._apply_xsa(y, v_heads)
 
             # Attention gating (from train_gpt.py)
             if self.attn_gate is not None:
-                y = y * torch.sigmoid(self.attn_gate(x[..., : self.attn_gate.weight.size(-1)])).view(
-                    B, T, self.num_heads, 1
-                )
+                y = y * torch.sigmoid(
+                    self.attn_gate(x[..., : self.attn_gate.weight.size(-1)])
+                ).transpose(1, 2).unsqueeze(-1)
 
-            y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+            y = y.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
 
             # Output projection using merged weights with sa_lambdas[1]
             y = self._project_o(y, sa_lambdas[1])
@@ -1459,30 +1797,43 @@ class CausalSelfAttention(nn.Module):
             return torch.where(mask, score, -float("inf"))
 
         # FlexAttention
-        y = _get_flex_attention()(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            block_mask=block_mask,
-            scale=attn_scale,
-            score_mod=score_mod,
-            kernel_options=_flex_attention_kernel_options,
-        ).transpose(1, 2)
+        if block_mask is not None and _get_flex_attention() is not None:
+            y = _get_flex_attention()(
+                q_heads,
+                k_heads,
+                v_heads,
+                block_mask=block_mask,
+                scale=attn_scale,
+                score_mod=score_mod,
+                enable_gqa=self.enable_gqa,
+                kernel_options=_flex_attention_kernel_options,
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q_heads,
+                k_heads,
+                v_heads,
+                attn_mask=None,
+                is_causal=True,
+                scale=float(attn_scale),
+                enable_gqa=self.enable_gqa,
+            )
+        y = self._apply_xsa(y, v_heads)
 
         # Attention gating (from train_gpt.py)
         if self.attn_gate is not None:
-            y = y * torch.sigmoid(self.attn_gate(x[..., : self.attn_gate.weight.size(-1)])).view(
-                B, T, self.num_heads, 1
-            )
+            y = y * torch.sigmoid(
+                self.attn_gate(x[..., : self.attn_gate.weight.size(-1)])
+            ).transpose(1, 2).unsqueeze(-1)
 
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        y = y.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
 
         # Output projection using merged weights with sa_lambdas[1]
         y = self._project_o(y, sa_lambdas[1])
 
         if kv_cache is not None and kv_cache.get("k") is None:
-            kv_cache["k"] = k
-            kv_cache["v"] = v
+            kv_cache["k"] = k_heads
+            kv_cache["v"] = v_heads
         return y
 
 
@@ -1491,6 +1842,7 @@ class Block(nn.Module):
         self,
         dim: int,
         num_heads: int,
+        num_kv_heads: int,
         max_seq_len: int,
         layer_idx: int,
         head_dim: int,
@@ -1506,6 +1858,12 @@ class Block(nn.Module):
         mlp_kwargs: dict = None,
         low_rank_config: dict | None = None,
         residual_connection: nn.Module = None,
+        qk_gain_init: float = 1.0,
+        ln_scale: bool = False,
+        canon_settings: CanonSettings | None = None,
+        canon_set: str = "",
+        use_xsa: bool = False,
+        use_boundary_delta: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -1513,12 +1871,17 @@ class Block(nn.Module):
         gating_config = gating_config or {}
         value_embed_layers = value_embed_layers or []
         low_rank_config = low_rank_config or {}
+        canon_settings = canon_settings or CanonSettings()
+        self.canon_enabled = canon_settings.enabled
+        self.use_resid_mix = self.canon_enabled and canon_settings.use_resid_mix
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
         # Skip attention of specific layers (e.g., layer 6 in train_gpt.py) by @YouJiacheng
         if not skip_attention:
             self.attn = CausalSelfAttention(
                 dim,
                 num_heads,
+                num_kv_heads,
                 max_seq_len,
                 head_dim,
                 layer_idx,
@@ -1526,9 +1889,18 @@ class Block(nn.Module):
                 value_embed_layers,
                 value_embed_gate_scale=value_embed_gate_scale,
                 low_rank_config=low_rank_config,
+                qk_gain_init=qk_gain_init,
+                canon_settings=canon_settings,
+                use_xsa=use_xsa,
+                use_canon_b=self.canon_enabled and "B" in canon_set,
             )
         else:
             self.attn = None
+
+        hidden_transform = None
+        if self.canon_enabled and "D" in canon_set:
+            hidden_dim = int(ffn_dim if ffn_dim is not None else 4 * dim)
+            hidden_transform = _build_canon_layer(hidden_dim, canon_settings)
 
         # FFN via factory — mlp_type selects the variant.
         self.mlp = _create_mlp(
@@ -1539,47 +1911,51 @@ class Block(nn.Module):
             activation=activation,
             ffn_dim=ffn_dim,
             low_rank_config=low_rank_config,
+            hidden_transform=hidden_transform,
             **(mlp_kwargs or {}),
         )
         self.residual_connection = residual_connection
+        self.attn_scale = None
+        self.mlp_scale = None
+        self.resid_mix = None
+        self.boundary_delta_gate = None
+        self.canon_a = None
+        self.canon_c = None
 
-    def _forward_standard(
-        self,
-        x: Tensor,
-        ve: Tensor,
-        sa_lambdas: Tensor,
-        block_mask,
-        cos: Tensor,
-        sin: Tensor,
-        attn_scale: float,
-        docs: Tensor,
-        key_offset: bool = False,
-        kv_cache: dict | None = None,
-        cache_docs: Tensor | None = None,
-    ):
-        # Attention branch
-        if self.attn is not None:
-            attn_out = self.attn(
-                norm(x),
-                ve,
-                sa_lambdas,
-                block_mask,
-                cos,
-                sin,
-                attn_scale,
-                docs,
-                key_offset,
-                kv_cache=kv_cache,
-                cache_docs=cache_docs,
+        if self.canon_enabled:
+            self.attn_scale = _set_param_metadata(
+                nn.Parameter(torch.ones(dim, dtype=torch.float32)),
+                "attn_scale",
             )
-            x = x + attn_out
-        # MLP branch — variants with internal norms skip the external norm()
-        mlp_input = norm(x) if getattr(self.mlp, "needs_external_norm", True) else x
-        mlp_out = self.mlp(mlp_input)
-        x = x + mlp_out
-        return x
+            self.mlp_scale = _set_param_metadata(
+                nn.Parameter(torch.ones(dim, dtype=torch.float32)),
+                "mlp_scale",
+            )
 
-    def _forward_delta(
+            if self.use_resid_mix:
+                self.resid_mix = _set_param_metadata(
+                    nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float()),
+                    "resid_mix",
+                )
+
+            if use_boundary_delta:
+                self.boundary_delta_gate = _set_param_metadata(
+                    nn.Parameter(
+                        torch.full(
+                            canon_settings.boundary_delta_gate_shape(dim),
+                            canon_settings.boundary_delta_gate_init,
+                            dtype=torch.float32,
+                        )
+                    ),
+                    "boundary_delta_gate",
+                )
+
+            if "A" in canon_set:
+                self.canon_a = _build_canon_layer(dim, canon_settings)
+            if "C" in canon_set:
+                self.canon_c = _build_canon_layer(dim, canon_settings)
+
+    def _forward_impl(
         self,
         x: Tensor,
         ve: Tensor,
@@ -1592,13 +1968,30 @@ class Block(nn.Module):
         key_offset: bool = False,
         kv_cache: dict | None = None,
         cache_docs: Tensor | None = None,
+        x0: Tensor | None = None,
+        return_delta: bool = False,
     ):
         residual = x
+        if self.resid_mix is not None:
+            if x0 is None:
+                raise ValueError("Canon resid_mix requires x0 to be passed into Block.forward")
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
-        # Attention branch
         if self.attn is not None:
+            if self.canon_enabled:
+                attn_input = norm(x) * self.ln_scale_factor
+                if self.boundary_delta_gate is not None:
+                    x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+                    gate = torch.sigmoid(self.boundary_delta_gate.to(dtype=x.dtype))
+                    attn_input = attn_input + (x - x_prev) * gate.view(1, 1, -1)
+                if self.canon_a is not None:
+                    attn_input = self.canon_a(attn_input)
+            else:
+                attn_input = norm(x)
+
             attn_out = self.attn(
-                norm(x),
+                attn_input,
                 ve,
                 sa_lambdas,
                 block_mask,
@@ -1610,13 +2003,22 @@ class Block(nn.Module):
                 kv_cache=kv_cache,
                 cache_docs=cache_docs,
             )
+            if self.attn_scale is not None:
+                attn_out = attn_out * self.attn_scale.to(dtype=x.dtype)[None, None, :]
             x = x + attn_out
 
-        # MLP branch — variants with internal norms skip the external norm()
-        mlp_input = norm(x) if getattr(self.mlp, "needs_external_norm", True) else x
+        if self.canon_enabled:
+            mlp_input = norm(x) * self.ln_scale_factor
+            if self.canon_c is not None:
+                mlp_input = self.canon_c(mlp_input)
+        else:
+            mlp_input = norm(x) if getattr(self.mlp, "needs_external_norm", True) else x
+
         mlp_out = self.mlp(mlp_input)
+        if self.mlp_scale is not None:
+            mlp_out = mlp_out * self.mlp_scale.to(dtype=x.dtype)[None, None, :]
         x = x + mlp_out
-        return x - residual
+        return x - residual if return_delta else x
 
     def forward(
         self,
@@ -1631,6 +2033,7 @@ class Block(nn.Module):
         key_offset: bool = False,
         kv_cache: dict | None = None,
         cache_docs: Tensor | None = None,
+        x0: Tensor | None = None,
     ):
         if self.residual_connection is not None:
             return self.residual_connection(
@@ -1645,9 +2048,10 @@ class Block(nn.Module):
                 key_offset,
                 kv_cache=kv_cache,
                 cache_docs=cache_docs,
+                x0=x0,
             )
 
-        return self._forward_standard(
+        return self._forward_impl(
             x,
             ve,
             sa_lambdas,
@@ -1659,6 +2063,7 @@ class Block(nn.Module):
             key_offset,
             kv_cache=kv_cache,
             cache_docs=cache_docs,
+            x0=x0,
         )
 
 
@@ -1675,6 +2080,7 @@ class GPT(nn.Module):
         skip_config: dict = None,
         rope_config: dict = None,
         embed_config: dict = None,
+        canon_config: dict = None,
         low_rank_config: dict = None,
         residual_connection_config: dict = None,
         wd_multipliers: dict = None,
@@ -1705,12 +2111,17 @@ class GPT(nn.Module):
         logits_softcap_scale = model_config["logits_softcap_scale"]
         logits_softcap_shift = model_config["logits_softcap_shift"]
         logits_softcap_divisor = model_config["logits_softcap_divisor"]
+        logits_softcap_mode = str(model_config.get("logits_softcap_mode", "sigmoid")).lower()
+        logits_tanh_cap = float(model_config.get("logits_tanh_cap", 30.0))
 
         vocab_size = model_config["vocab_size"]
         num_layers = model_config["num_layers"]
         num_heads = model_config["num_heads"]
+        num_kv_heads = int(model_config.get("num_kv_heads", num_heads))
         model_dim = model_config["model_dim"]
         head_dim = model_config["head_dim"]
+        qk_gain_init = float(model_config.get("qk_gain_init", 1.0))
+        ln_scale = bool(model_config.get("ln_scale", False))
         block_size = attention_config["block_size"]
         self.activation = model_config.get("activation", "relu_squared")
         self.ffn_dim = model_config.get("ffn_dim", None)
@@ -1736,21 +2147,45 @@ class GPT(nn.Module):
         self.vocab_size_padded = vocab_size_padded
         self.num_layers = num_layers
         self.model_dim = model_dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.canon_settings = CanonSettings.from_config(canon_config, num_layers=num_layers)
+
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("model_config.num_heads must be divisible by model_config.num_kv_heads")
+        if self.canon_settings.enabled and mlp_type != "default":
+            raise ValueError("canon_config.enabled=True currently requires model_config.mlp_type='default'")
+        if logits_softcap_mode not in {"sigmoid", "tanh"}:
+            raise ValueError(
+                f"model_config.logits_softcap_mode must be 'sigmoid' or 'tanh', got {logits_softcap_mode!r}"
+            )
+        if logits_tanh_cap <= 0:
+            raise ValueError("model_config.logits_tanh_cap must be > 0")
 
         # Positional embedding (YaRN, HalfRoPE, StandardRoPE, or none)
         self.pos_emb = create_positional_embedding(self.rope_config, head_dim, max_seq_len, block_size)
 
         # Smear gate: shift token embeddings forward (from train_gpt.py @classiclarryd)
         gate_input_dim = self.gating_config["gate_input_dim"]
-        if self.gating_config.get("use_smear_gate", True):
+        if self.canon_settings.enabled and self.canon_settings.smear_mode == "canon_vector":
+            self.canon_smear = VectorSmearGate(model_dim)
+            _set_param_metadata(
+                self.canon_smear.gate,
+                "smear_gate",
+                lr_mul=lr_multipliers["smear_gate"],
+            )
+            self.smear_gate = None
+        elif self.gating_config.get("use_smear_gate", True):
             self.smear_gate = CastedLinear(gate_input_dim, 1)
             self.smear_gate.weight.label = "smear_gate"
             self.smear_gate.weight.lr_mul = lr_multipliers["smear_gate"]
+            self.canon_smear = None
         else:
             self.smear_gate = None
+            self.canon_smear = None
 
         # Skip gate (from train_gpt.py)
-        if self.gating_config.get("use_skip_gate", True):
+        if self.canon_settings.skip_topology == "ramen" and self.gating_config.get("use_skip_gate", True):
             self.skip_gate = CastedLinear(gate_input_dim, 1)
             self.skip_gate.weight.label = "skip_gate"
             self.skip_gate.weight.lr_mul = lr_multipliers["skip_gate"]
@@ -1768,13 +2203,27 @@ class GPT(nn.Module):
             nn.init.zeros_(embed.weight)
             embed.weight.label = "value_embed"
 
+        if self.canon_settings.enabled and self.canon_settings.bigram_vocab_size > 0:
+            if self.canon_settings.bigram_dim <= 0:
+                raise ValueError("canon_config.bigram_dim must be > 0 when bigram_vocab_size is enabled")
+            self.bigram = BigramHashEmbedding(
+                self.canon_settings.bigram_vocab_size,
+                self.canon_settings.bigram_dim,
+                model_dim,
+            )
+            _set_param_metadata(self.bigram.scale, "bigram_scale")
+        else:
+            self.bigram = None
+
         # Blocks with gating config (matching train_gpt.py)
         value_embed_layers = attention_pattern_config["value_embed_layers"]
-        self.blocks = nn.ModuleList(
-            [
+        blocks = []
+        for i in range(num_layers):
+            blocks.append(
                 Block(
                     model_dim,
                     num_heads,
+                    num_kv_heads,
                     max_seq_len,
                     i,
                     head_dim,
@@ -1789,15 +2238,34 @@ class GPT(nn.Module):
                     mlp_type=mlp_type,
                     low_rank_config=self.low_rank_config,
                     mlp_kwargs=mlp_kwargs,
+                    qk_gain_init=qk_gain_init,
+                    ln_scale=ln_scale,
+                    canon_settings=self.canon_settings,
+                    canon_set=self.canon_settings.layer_set_for(i, num_layers),
+                    use_xsa=self.canon_settings.uses_xsa(i, num_layers),
+                    use_boundary_delta=self.canon_settings.uses_boundary_delta(i),
                 )
-                for i in range(num_layers)
-            ]
-        )
+            )
+        self.blocks = nn.ModuleList(blocks)
 
         for block in self.blocks:
             if block.attn is not None:
                 self.low_rank_pairs.extend(block.attn.low_rank_pairs)
             self.low_rank_pairs.extend(getattr(block.mlp, "low_rank_pairs", []))
+
+        if self.canon_settings.enabled and self.canon_settings.skip_topology == "canon_unet":
+            self.num_encoder_layers = num_layers // 2
+            self.num_decoder_layers = num_layers - self.num_encoder_layers
+            self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+            self.skip_weights = _set_param_metadata(
+                nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32)),
+                "skip_weights",
+            )
+        else:
+            self.num_encoder_layers = 0
+            self.num_decoder_layers = 0
+            self.num_skip_weights = 0
+            self.register_parameter("skip_weights", None)
 
         # LM head with proper initialization
         self.lm_head = CastedLinear(model_dim, vocab_size_padded, use_fp8=False)
@@ -1873,6 +2341,8 @@ class GPT(nn.Module):
         self._logits_softcap_scale = logits_softcap_scale
         self._logits_softcap_shift = logits_softcap_shift
         self._logits_softcap_divisor = logits_softcap_divisor
+        self._logits_softcap_mode = logits_softcap_mode
+        self._logits_tanh_cap = logits_tanh_cap
         self._model_wd_multipliers = wd_multipliers
 
         (
@@ -1885,10 +2355,13 @@ class GPT(nn.Module):
             model_dim,
         )
 
+        if self.canon_settings.use_resid_mix and self._residual_connection_init is not None:
+            raise ValueError("canon_config.use_resid_mix is not supported with residual_connection_config modes")
+
         if self._residual_connection_init is not None:
             for i, block in enumerate(self.blocks):
                 block.residual_connection = self._residual_connection_init(
-                    branch=block._forward_delta,
+                    branch=partial(block._forward_impl, return_delta=True),
                     layer_index=i,
                 )
 
@@ -1966,6 +2439,190 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
+    def _build_value_embeddings(self, input_seq: Tensor) -> list[Tensor | None]:
+        num_layers = len(self.blocks)
+        if len(self.value_embeds) == 0:
+            return [None] * num_layers
+
+        ve_computed = [value_embed(input_seq) for value_embed in self.value_embeds]
+        ve = (
+            [ve_computed[i] for i in self._value_embed_head_indices]
+            + [None] * (num_layers - self._value_embed_mid_layer_count)
+            + [ve_computed[i] for i in self._value_embed_tail_indices]
+        )
+        assert len(ve) == num_layers
+        return ve
+
+    def _build_attention_layout(
+        self,
+        input_seq: Tensor,
+        *,
+        is_decode: bool,
+        cache_docs: Tensor | None,
+        sliding_window_num_blocks: Tensor,
+    ) -> tuple[Tensor, list, list[bool]]:
+        requires_mask = [block.attn is not None for block in self.blocks]
+        docs: Tensor
+        if is_decode:
+            assert cache_docs is not None
+            current_doc = cache_docs[-1] + (input_seq[-1] == self._eos_token_id).to(cache_docs.dtype)
+            docs = current_doc.view(1)
+        else:
+            docs = (input_seq == self._eos_token_id).cumsum(0)
+
+        long_bm = short_bm = None
+        if any(requires_mask) and not is_decode:
+            long_bm, short_bm = self.create_blockmasks(docs, sliding_window_num_blocks)
+
+        block_masks = []
+        key_offsets = []
+        for needs_mask, char in zip(requires_mask, self.attention_pattern_config["block_mask_pattern"]):
+            if is_decode or not needs_mask:
+                block_masks.append(None)
+                key_offsets.append(False)
+            elif char == "L":
+                block_masks.append(long_bm)
+                key_offsets.append(True)
+            elif char == "S":
+                block_masks.append(short_bm)
+                key_offsets.append(False)
+            elif char == "N":
+                block_masks.append(None)
+                key_offsets.append(False)
+            else:
+                raise ValueError(
+                    f"Invalid block mask pattern character: {char}. Use 'L', 'S', or 'N'."
+                )
+
+        assert len(block_masks) == len(self.blocks)
+        return docs, block_masks, key_offsets
+
+    def _embed_tokens(self, input_seq: Tensor) -> Tensor:
+        if self.split_embed and self.embed is not None:
+            x = self.embed(input_seq)
+        else:
+            x = F.embedding(input_seq, self.lm_head.weight)
+        if self.bigram is not None:
+            x = x + self.bigram(input_seq)
+        return x
+
+    def _apply_input_smear(
+        self,
+        x: Tensor,
+        cache_smear_state: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
+        smear_lambda = self.scalars[3 * self.num_layers]
+        x_raw = x
+        smear_state_to_cache = None
+
+        if self.canon_smear is not None:
+            x = norm(x[None])
+            pre_smear_x = x
+            prev_state = cache_smear_state if x.shape[1] == 1 and cache_smear_state is not None else None
+            x = self.canon_smear(x, prev_state=prev_state)
+            smear_state_to_cache = pre_smear_x[0, -1].detach()
+            return x, x, smear_state_to_cache
+
+        if self.smear_gate is not None:
+            gate_width = self.smear_gate.weight.size(-1)
+            if x.shape[0] == 1 and cache_smear_state is not None:
+                smear_gate_out = torch.sigmoid(self.smear_gate(x[:, :gate_width]))
+                x = x_raw + (smear_lambda * smear_gate_out) * cache_smear_state.view(1, -1)
+            else:
+                smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :gate_width]))
+                x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
+            smear_state_to_cache = x_raw[-1].detach()
+
+        x = norm(x[None])
+        return x, x, smear_state_to_cache
+
+    def _apply_block(
+        self,
+        layer_idx: int,
+        hidden: Tensor,
+        *,
+        x0: Tensor,
+        ve: list[Tensor | None],
+        sa_lambdas: Tensor,
+        block_masks: list,
+        cos: Tensor,
+        sin: Tensor,
+        attn_scale: float,
+        docs: Tensor,
+        key_offsets: list[bool],
+        cache_layers: list[dict] | None,
+        cache_docs: Tensor | None,
+    ) -> Tensor:
+        if not self.canon_settings.use_resid_mix:
+            if layer_idx == self._residual_first_layer_index:
+                hidden = (self.scalars[0] + self.x0_lambdas[0]) * hidden
+            else:
+                hidden = self.scalars[layer_idx] * hidden + self.x0_lambdas[layer_idx] * x0
+
+        return self.blocks[layer_idx](
+            hidden,
+            ve[layer_idx],
+            sa_lambdas[layer_idx],
+            block_masks[layer_idx],
+            cos,
+            sin,
+            attn_scale,
+            docs,
+            key_offsets[layer_idx],
+            kv_cache=cache_layers[layer_idx] if cache_layers is not None else None,
+            cache_docs=cache_docs,
+            x0=x0,
+        )
+
+    def _run_canon_unet_blocks(self, x: Tensor, apply_block: Callable[[int, Tensor], Tensor]) -> Tensor:
+        skip_connections = []
+        for i in range(self.num_encoder_layers):
+            x = apply_block(i, x)
+            skip_connections.append(x)
+        for i in range(self.num_decoder_layers):
+            if skip_connections and self.skip_weights is not None:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_connections.pop()
+            x = apply_block(self.num_encoder_layers + i, x)
+        return x
+
+    def _run_ramen_blocks(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        apply_block: Callable[[int, Tensor], Tensor],
+        *,
+        skip_in_layers: list[int],
+        skip_out_layers: list[int],
+        backout_layer: int,
+        backout_lambda: Tensor,
+        skip_lambda: Tensor,
+    ) -> Tensor:
+        skip_connections = []
+        x_backout = None
+
+        for i in range(len(self.blocks)):
+            if i in skip_out_layers and skip_connections:
+                if self.skip_gate is not None:
+                    skip_gate_out = (
+                        torch.sigmoid(skip_lambda)
+                        * self._skip_gate_scale
+                        * torch.sigmoid(self.skip_gate(x0[..., : self.skip_gate.weight.size(-1)]))
+                    )
+                    x = x + skip_gate_out * skip_connections.pop()
+                else:
+                    x = x + skip_connections.pop()
+
+            x = apply_block(i, x)
+
+            if i in skip_in_layers:
+                skip_connections.append(x)
+            if i == backout_layer:
+                x_backout = x
+
+        if x_backout is not None:
+            x = x - backout_lambda * x_backout
+        return x
+
     def _compute_mtp_loss(self, logits_flat: Tensor, target_seq: Tensor, mtp_weights: Tensor):
         """Compute multi-token prediction loss with weighted offsets.
 
@@ -2026,155 +2683,73 @@ class GPT(nn.Module):
                 and len(cache_layers) == self.num_layers
             )
 
-        # Get skip/backout config
-        skip_in_layers = self.skip_config["skip_in_layers"]
-        skip_out_layers = self.skip_config["skip_out_layers"]
-        backout_layer = self.skip_config["backout_layer"]
+        skip_in_layers = self.skip_config.get("skip_in_layers", [])
+        skip_out_layers = self.skip_config.get("skip_out_layers", [])
+        backout_layer = self.skip_config.get("backout_layer", -1)
 
-        # Build value embeddings pattern from config (from train_gpt.py)
-        # train_gpt.py pattern: [ve[1], ve[2]] + [None] * (num_layers - 5) + [ve[0], ve[1], ve[2]]
-        # 012 ... 012 structure by @YouJiacheng, improved on @leloykun's U-net structure
-        # dropping first layer updates this to .12 ... 012
-        ve_computed = [value_embed(input_seq) for value_embed in self.value_embeds]
-        num_layers = len(self.blocks)
-        ve = (
-            [ve_computed[i] for i in self._value_embed_head_indices]
-            + [None] * (num_layers - self._value_embed_mid_layer_count)
-            + [ve_computed[i] for i in self._value_embed_tail_indices]
+        ve = self._build_value_embeddings(input_seq)
+        docs, block_masks, key_offsets = self._build_attention_layout(
+            input_seq,
+            is_decode=is_decode,
+            cache_docs=cache_docs,
+            sliding_window_num_blocks=sliding_window_num_blocks,
         )
-        assert len(ve) == num_layers
+        x, x0, smear_state_to_cache = self._apply_input_smear(
+            self._embed_tokens(input_seq),
+            cache_smear_state,
+        )
 
-        # Build block masks pattern and key_offset flags
-        requires_mask = []
-        any_requires_mask = False
-        for blk in self.blocks:
-            needs = blk.attn is not None
-            requires_mask.append(needs)
-            any_requires_mask = any_requires_mask or needs
-
-        if is_decode:
-            assert cache_docs is not None
-            current_doc = cache_docs[-1] + (input_seq[-1] == self._eos_token_id).to(
-                cache_docs.dtype
-            )
-            docs = current_doc.view(1)
-        else:
-            docs = (input_seq == self._eos_token_id).cumsum(0)
-
-        if any_requires_mask and not is_decode:
-            long_bm, short_bm = self.create_blockmasks(docs, sliding_window_num_blocks)
-        block_masks = []
-        key_offsets = []  # Key offset flags for each layer (True for long windows)
-        for i, char in enumerate(self.attention_pattern_config["block_mask_pattern"]):
-            if not requires_mask[i]:
-                block_masks.append(None)
-                key_offsets.append(False)
-            elif char == "L":
-                block_masks.append(long_bm)
-                key_offsets.append(True)  # Apply key offset on long window layers
-            elif char == "S":
-                block_masks.append(short_bm)
-                key_offsets.append(False)
-            elif char == "N":
-                block_masks.append(None)  # Skip attention
-                key_offsets.append(False)
-            else:
-                raise ValueError(
-                    f"Invalid block mask pattern character: {char}. Use 'L', 'S', or 'N'."
-                )
-        assert len(block_masks) == len(self.blocks)
-
-        # Get embedding (weight-tied or separate)
-        if self.split_embed and self.embed is not None:
-            x = self.embed(input_seq)
-        else:
-            x = F.embedding(input_seq, self.lm_head.weight)
-
-        # Smear gate: shift token embeddings forward (from train_gpt.py @classiclarryd)
-        smear_lambda = self.scalars[3 * self.num_layers]
-        x_raw = x
-        if self.smear_gate is not None:
-            gate_width = self.smear_gate.weight.size(-1)
-            if x.shape[0] == 1 and cache_smear_state is not None:
-                smear_gate_out = torch.sigmoid(self.smear_gate(x[:, :gate_width]))
-                x = x_raw + (smear_lambda * smear_gate_out) * cache_smear_state.view(1, 1, -1)
-            else:
-                smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :gate_width]))
-                x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
-
-        x = x0 = norm(x[None])
         x = self._residual_connection_expand(x)
         x0 = self._residual_connection_expand(x0)
 
-        # Extract lambdas from scalars
-        resid_lambdas = self.scalars[: self.num_layers]
-        x0_lambdas = self.x0_lambdas
         sa_lambdas = self.scalars[self.num_layers : 3 * self.num_layers].view(-1, 2)
         backout_lambda = self.scalars[3 * self.num_layers + 1]
         skip_lambda = self.scalars[3 * self.num_layers + 2]
 
-        # Get RoPE values from positional embedding
         cos, sin = self.pos_emb.cos, self.pos_emb.sin
         attn_scale = self.pos_emb.attn_scale
 
-        # Skip connections
-        skip_connections = []
-        x_backout = None
+        apply_block = partial(
+            self._apply_block,
+            x0=x0,
+            ve=ve,
+            sa_lambdas=sa_lambdas,
+            block_masks=block_masks,
+            cos=cos,
+            sin=sin,
+            attn_scale=attn_scale,
+            docs=docs,
+            key_offsets=key_offsets,
+            cache_layers=cache_layers,
+            cache_docs=cache_docs,
+        )
 
-        for i in range(len(self.blocks)):
-            # Apply skip connection from earlier layers
-            if i in skip_out_layers and skip_connections:
-                if self.skip_gate is not None:
-                    skip_gate_out = (
-                        torch.sigmoid(skip_lambda)
-                        * self._skip_gate_scale
-                        * torch.sigmoid(self.skip_gate(x0[..., : self.skip_gate.weight.size(-1)]))
-                    )
-                    x = x + skip_gate_out * skip_connections.pop()
-                else:
-                    x = x + skip_connections.pop()
-
-            # Apply residual mixing
-            if i == self._residual_first_layer_index:
-                x = (resid_lambdas[0] + x0_lambdas[0]) * x
-            else:
-                x = resid_lambdas[i] * x + x0_lambdas[i] * x0
-
-            x = self.blocks[i](
+        if self.canon_settings.skip_topology == "canon_unet":
+            x = self._run_canon_unet_blocks(x, apply_block)
+        else:
+            x = self._run_ramen_blocks(
                 x,
-                ve[i],
-                sa_lambdas[i],
-                block_masks[i] if not is_decode else None,
-                cos,
-                sin,
-                attn_scale,
-                docs,
-                key_offsets[i],
-                kv_cache=cache_layers[i] if cache_layers is not None else None,
-                cache_docs=cache_docs,
+                x0,
+                apply_block,
+                skip_in_layers=skip_in_layers,
+                skip_out_layers=skip_out_layers,
+                backout_layer=backout_layer,
+                backout_lambda=backout_lambda,
+                skip_lambda=skip_lambda,
             )
-
-            # Save skip connection
-            if i in skip_in_layers:
-                skip_connections.append(x)
-
-            # Save for backout
-            if i == backout_layer:
-                x_backout = x
-
-        # Backout: subtract contribution from early layers
-        if x_backout is not None:
-            x = x - backout_lambda * x_backout
 
         x = self._residual_connection_reduce(x)
         x = norm(x)
         logits = self.lm_head(x)
 
-        # Updated softcap formula @classiclarryd
-        # 23 * sigmoid((logits + 5) / 7.5)
-        logits = self._logits_softcap_scale * torch.sigmoid(
-            (logits + self._logits_softcap_shift) / self._logits_softcap_divisor
-        )
+        if self._logits_softcap_mode == "tanh":
+            logits = self._logits_tanh_cap * torch.tanh(logits / self._logits_tanh_cap)
+        else:
+            # Updated softcap formula @classiclarryd
+            # 23 * sigmoid((logits + 5) / 7.5)
+            logits = self._logits_softcap_scale * torch.sigmoid(
+                (logits + self._logits_softcap_shift) / self._logits_softcap_divisor
+            )
         logits_for_loss = logits.float() if not self.training else logits
 
         if kv_cache is not None and is_decode:
@@ -2185,10 +2760,7 @@ class GPT(nn.Module):
         elif kv_cache is not None:
             kv_cache["docs"] = docs.to(dtype=torch.int32)
         if kv_cache is not None:
-            if self.smear_gate is not None:
-                kv_cache["smear_state"] = x_raw[-1].detach()
-            else:
-                kv_cache["smear_state"] = None
+            kv_cache["smear_state"] = smear_state_to_cache
 
         # Language modeling loss
         if return_logits:

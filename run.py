@@ -90,6 +90,19 @@ def _parse_args():
         default=None,
         help="Save checkpoints every K steps (overrides training_config.checkpoint_every; 0 disables periodic saves)",
     )
+    parser.add_argument(
+        "--muon_split",
+        action="store_true",
+        default=False,
+        help="Enable Muon Split: per-head/group orthogonalization in NorMuon.",
+    )
+    parser.add_argument(
+        "--muon_decorrelate",
+        action="store_true",
+        default=False,
+        help="Enable Gram-Schmidt decorrelation across heads/groups in Muon Split.",
+    )
+
     return parser.parse_args()
 
 
