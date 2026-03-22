@@ -585,6 +585,7 @@ class DefaultMLP(nn.Module):
         activation: str = "relu_squared",
         ffn_dim: int | None = None,
         low_rank_config: dict | None = None,
+        hidden_transform: nn.Module | None = None,
     ):
         super().__init__()
 
@@ -598,6 +599,9 @@ class DefaultMLP(nn.Module):
         self.low_rank_pairs: list[tuple[Tensor, Tensor]] = []
 
         self.is_glu, self.activation_fn = _get_activation_spec(activation)
+        if hidden_transform is not None and self.is_glu:
+            raise ValueError("DefaultMLP hidden_transform is only supported for non-GLU activations.")
+        self.hidden_transform = hidden_transform
 
         if ffn_dim is None:
             ffn_dim = 4 * dim
@@ -710,6 +714,8 @@ class DefaultMLP(nn.Module):
             x = self.activation_fn(x_gate) * x_sig
         else:
             x = self.activation_fn(x)
+            if self.hidden_transform is not None:
+                x = self.hidden_transform(x)
         proj_input = x
         if self.use_factorized:
             x = self.c_proj(proj_input)

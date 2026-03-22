@@ -9,6 +9,7 @@ model_config = dict(
     vocab_size=50257,
     num_layers=NUM_LAYERS,
     num_heads=4,
+    num_kv_heads=4,
     model_dim=256,
     head_dim=64,
     activation="relu_squared",
@@ -25,6 +26,10 @@ model_config = dict(
     logits_softcap_scale=23.0,
     logits_softcap_shift=5.0,
     logits_softcap_divisor=7.5,
+    logits_softcap_mode="sigmoid",
+    logits_tanh_cap=30.0,
+    qk_gain_init=1.0,
+    ln_scale=False,
 )
 
 gating_config = dict(
@@ -39,6 +44,7 @@ rope_config = dict(
     type="yarn",           # "yarn", "half_rope", "rope", "none", or "nope"
     base_freq=1024,
     initial_attn_scale=0.1,
+    rope_dims=0,
 )
 
 embed_config = dict(
@@ -67,6 +73,33 @@ residual_connection_config = dict(
     ns_coeffs=(3.0, -3.2, 1.2),
     mhc_residual_identity_mix=False,
     mhc_residual_alpha=0.01,
+)
+
+canon_config = dict(
+    enabled=False,
+    set="ABCD",
+    kernel=4,
+    first_n=0,
+    last_n=0,
+    layers=(),
+    bias=False,
+    activation=False,
+    residual=True,
+    delta_gate=False,
+    delta_gate_init=-4.0,
+    xsa_last_n=0,
+    xsa_learnable_gate=False,
+    xsa_gate_init=2.0,
+    boundary_delta_enabled=False,
+    boundary_delta_first_n=0,
+    boundary_delta_gate_vector=False,
+    boundary_delta_gate_init=-4.0,
+    use_resid_mix=False,
+    smear_mode="ramen",
+    skip_topology="ramen",
+    bigram_vocab_size=0,
+    bigram_dim=0,
+    use_fast_conv1d=True,
 )
 
 # Data layout matches the FineWeb shards used by baseline configs.
@@ -151,6 +184,9 @@ optimizer_config = dict(
         momentum_cooldown_frac=0.10,
         beta2=0.95,
         nesterov=True,
+        muon_split=False,       # per-head/group orthogonalization for attn+MLP weights
+        muon_decorrelate=False, # Gram-Schmidt decorrelation across heads/groups
+        mlp_split_groups=0,     # number of neuron groups for MLP split (0=disabled)
     ),
     aro=dict(
         lr=0.0003,
@@ -295,7 +331,7 @@ validation_inference = dict(
 )
 
 mtp_config = dict(
-    enabled=True,
+    enabled=False,
     schedule=[
         dict(mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
         dict(mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
@@ -303,6 +339,7 @@ mtp_config = dict(
     ],
     transitions=[1/3, 2/3],
 )
+
 
 compilation_config = dict(
     compile_model=True,
