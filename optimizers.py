@@ -212,8 +212,16 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
                 weight_decay=muon_cfg.get("weight_decay", 0.0),
                 nesterov=muon_cfg.get("nesterov", True),
                 scale_weight_decay_by_lr=scale_weight_decay_by_lr,
+                muon_split=muon_cfg.get("muon_split", False),
+                muon_decorrelate=muon_cfg.get("muon_decorrelate", False),
             )
-            print_fn(f"Using NorMuon optimizer for {len(hidden_matrix_params)} matrix parameters")
+            split_info = []
+            if muon_cfg.get("muon_split", False):
+                split_info.append("split")
+            if muon_cfg.get("muon_decorrelate", False):
+                split_info.append("decorrelate")
+            extra = f" [{', '.join(split_info)}]" if split_info else ""
+            print_fn(f"Using NorMuon optimizer for {len(hidden_matrix_params)} matrix parameters{extra}")
 
         if matrix_opt is not None:
             optimizers = [adam_opt, matrix_opt]
@@ -548,6 +556,26 @@ class Adam(torch.optim.Optimizer):
                 p.add_(update, alpha=-1.0)
 
 
+def _decorrelate_groups(g: torch.Tensor) -> torch.Tensor:
+    """Gram-Schmidt decorrelation across groups within each section.
+
+    g: (sections, G, group_size, dim) — G groups per section.
+    For each section, projects each group's update to be orthogonal to all
+    preceding groups, forcing maximally diverse update directions.
+    Returns same shape tensor with decorrelated groups.
+    """
+    S, G, gs, d = g.shape
+    g_flat = g.reshape(S, G, -1).float()  # (S, G, gs*d)
+    out = g_flat.clone()
+    for i in range(1, G):
+        # Project out components along all previous groups
+        prev = out[:, :i]                          # (S, i, gs*d)
+        prev_norm = prev / (prev.norm(dim=-1, keepdim=True) + 1e-8)
+        dots = (out[:, i : i + 1] * prev_norm).sum(dim=-1, keepdim=True)  # (S, i, 1)
+        out[:, i] -= (dots * prev_norm).sum(dim=1)  # (S, gs*d)
+    return out.reshape(S, G, gs, d).to(g.dtype)
+
+
 class NorMuon(torch.optim.Optimizer):
     """
     NorMuon - MomentUm Orthogonalized by Newton-schulz with variance reduction
@@ -563,6 +591,8 @@ class NorMuon(torch.optim.Optimizer):
         weight_decay=0.0,
         nesterov=True,
         scale_weight_decay_by_lr=False,
+        muon_split=False,
+        muon_decorrelate=False,
     ):
         defaults = dict(
             lr=lr,
@@ -571,6 +601,8 @@ class NorMuon(torch.optim.Optimizer):
             weight_decay=weight_decay,
             nesterov=nesterov,
             scale_weight_decay_by_lr=scale_weight_decay_by_lr,
+            muon_split=muon_split,
+            muon_decorrelate=muon_decorrelate,
         )
         super().__init__(params, defaults)
 
@@ -604,7 +636,28 @@ class NorMuon(torch.optim.Optimizer):
                 buf.lerp_(g, 1 - group["momentum"])
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
 
-                g = polar_express(g)
+                # Muon Split: per-group orthogonalization
+                n_split = getattr(p, "muon_split_heads", 0)
+                n_groups = getattr(p, "muon_split_groups", 0)
+                muon_split = group.get("muon_split", False)
+                decorrelate = group.get("muon_decorrelate", False)
+
+                if n_split > 0 and muon_split and g.ndim == 2:
+                    # Attention: split into per-head blocks for Q,K,V,O
+                    sections = 4
+                    head_dim = g.size(0) // (sections * n_split)
+                    g_heads = polar_express(
+                        g.reshape(sections * n_split, head_dim, g.size(1))
+                    )
+                    # Cross-head gradient decorrelation: Gram-Schmidt across
+                    # heads within each section so updates are mutually orthogonal
+                    if decorrelate:
+                        g_heads = _decorrelate_groups(
+                            g_heads.reshape(sections, n_split, head_dim, g.size(1))
+                        ).reshape(sections * n_split, head_dim, g.size(1))
+                    g = g_heads.reshape(p.shape)
+                else:
+                    g = polar_express(g)
 
                 is_gate = "gate" in getattr(p, "label", "")
                 param_shape = p.shape
