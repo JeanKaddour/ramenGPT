@@ -23,6 +23,12 @@ import uuid
 from pathlib import Path
 from typing import TypedDict
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import modal
 
 # ---------------------------------------------------------------------------
@@ -77,10 +83,7 @@ image = (
     .add_local_dir(
         ".",
         remote_path=WORKDIR,
-        condition=lambda pth: not any(
-            x in pth
-            for x in [".venv", "wandb", "logs", "data/fineweb10B", "__pycache__", ".git"]
-        ),
+        ignore=[".venv", "wandb", "logs", "data/fineweb10B", "__pycache__", ".git"],
     )
 )
 
