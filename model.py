@@ -1,6 +1,5 @@
 import itertools
 import math
-from dataclasses import dataclass
 from functools import partial
 from random import randrange
 from typing import Callable
@@ -94,143 +93,6 @@ def identity(t):
 
 def add(x, y):
     return x + y
-
-
-def _set_param_metadata(param: nn.Parameter, label: str, *, lr_mul: float = 1.0, wd_mul: float = 0.0):
-    param.label = label
-    param.lr_mul = lr_mul
-    param.wd_mul = wd_mul
-    return param
-
-
-@dataclass(frozen=True)
-class CanonSettings:
-    enabled: bool = False
-    set: str = "ABCD"
-    first_n: int = 0
-    last_n: int = 0
-    layers: tuple[int, ...] = ()
-    xsa_last_n: int = 0
-    xsa_learnable_gate: bool = False
-    xsa_gate_init: float = 2.0
-    boundary_delta_enabled: bool = False
-    boundary_delta_first_n: int = 0
-    boundary_delta_gate_vector: bool = False
-    boundary_delta_gate_init: float = -4.0
-    use_resid_mix: bool = False
-    smear_mode: str = "ramen"
-    skip_topology: str = "ramen"
-    bigram_vocab_size: int = 0
-    bigram_dim: int = 0
-    kernel: int = 4
-    bias: bool = False
-    activation: bool = False
-    residual: bool = True
-    delta_gate: bool = False
-    delta_gate_init: float = -4.0
-    use_fast_conv1d: bool = True
-
-    @classmethod
-    def from_config(cls, canon_config: dict | None, *, num_layers: int) -> "CanonSettings":
-        canon_config = canon_config or {}
-        layers = tuple(
-            int(layer) for layer in canon_config.get("layers", ()) if str(layer).strip()
-        )
-        layers = tuple(dict.fromkeys(layers))
-        first_n = int(canon_config.get("first_n", 0))
-        last_n = int(canon_config.get("last_n", 0))
-        boundary_delta_first_n = int(canon_config.get("boundary_delta_first_n", 0))
-        smear_mode = str(canon_config.get("smear_mode", "ramen")).lower()
-        skip_topology = str(canon_config.get("skip_topology", "ramen")).lower()
-
-        if smear_mode not in {"ramen", "canon_vector"}:
-            raise ValueError("canon_config.smear_mode must be 'ramen' or 'canon_vector'")
-        if skip_topology not in {"ramen", "canon_unet"}:
-            raise ValueError("canon_config.skip_topology must be 'ramen' or 'canon_unet'")
-        if first_n < 0 or last_n < 0:
-            raise ValueError("canon_config.first_n and canon_config.last_n must be >= 0")
-        if first_n > num_layers or last_n > num_layers:
-            raise ValueError("canon_config.first_n/last_n cannot exceed model_config.num_layers")
-        if boundary_delta_first_n < 0 or boundary_delta_first_n > num_layers:
-            raise ValueError(
-                "canon_config.boundary_delta_first_n must be between 0 and model_config.num_layers"
-            )
-        if any(layer < 1 or layer > num_layers for layer in layers):
-            raise ValueError(
-                f"canon_config.layers must use 1-based indices within [1, {num_layers}], got {layers}"
-            )
-
-        enabled = bool(canon_config.get("enabled", False))
-        return cls(
-            enabled=enabled,
-            set=str(canon_config.get("set", "ABCD")).upper(),
-            first_n=first_n,
-            last_n=last_n,
-            layers=layers,
-            xsa_last_n=int(canon_config.get("xsa_last_n", 0)),
-            xsa_learnable_gate=bool(canon_config.get("xsa_learnable_gate", False)),
-            xsa_gate_init=float(canon_config.get("xsa_gate_init", 2.0)),
-            boundary_delta_enabled=bool(canon_config.get("boundary_delta_enabled", False)),
-            boundary_delta_first_n=boundary_delta_first_n,
-            boundary_delta_gate_vector=bool(
-                canon_config.get("boundary_delta_gate_vector", False)
-            ),
-            boundary_delta_gate_init=float(
-                canon_config.get("boundary_delta_gate_init", -4.0)
-            ),
-            use_resid_mix=enabled and bool(canon_config.get("use_resid_mix", False)),
-            smear_mode=smear_mode,
-            skip_topology=skip_topology,
-            bigram_vocab_size=int(canon_config.get("bigram_vocab_size", 0)),
-            bigram_dim=int(canon_config.get("bigram_dim", 0)),
-            kernel=int(canon_config.get("kernel", 4)),
-            bias=bool(canon_config.get("bias", False)),
-            activation=bool(canon_config.get("activation", False)),
-            residual=bool(canon_config.get("residual", True)),
-            delta_gate=bool(canon_config.get("delta_gate", False)),
-            delta_gate_init=float(canon_config.get("delta_gate_init", -4.0)),
-            use_fast_conv1d=bool(canon_config.get("use_fast_conv1d", True)),
-        )
-
-    @property
-    def explicit_layers(self) -> frozenset[int]:
-        return frozenset(layer - 1 for layer in self.layers)
-
-    def layer_kwargs(self) -> dict:
-        return dict(
-            kernel=self.kernel,
-            bias=self.bias,
-            activation=self.activation,
-            residual=self.residual,
-            delta_gate=self.delta_gate,
-            delta_gate_init=self.delta_gate_init,
-            use_fast_conv1d=self.use_fast_conv1d,
-        )
-
-    def boundary_delta_gate_shape(self, dim: int) -> tuple[int, ...]:
-        return (dim,) if self.boundary_delta_gate_vector else (1,)
-
-    def use_layer_hooks(self, layer_idx: int, num_layers: int) -> bool:
-        if not self.enabled:
-            return False
-        if self.layers:
-            return layer_idx in self.explicit_layers
-        if self.first_n > 0 or self.last_n > 0:
-            return layer_idx < self.first_n or layer_idx >= num_layers - self.last_n
-        return True
-
-    def layer_set_for(self, layer_idx: int, num_layers: int) -> str:
-        return self.set if self.use_layer_hooks(layer_idx, num_layers) else ""
-
-    def uses_xsa(self, layer_idx: int, num_layers: int) -> bool:
-        return self.enabled and layer_idx >= max(0, num_layers - self.xsa_last_n)
-
-    def uses_boundary_delta(self, layer_idx: int) -> bool:
-        return self.enabled and self.boundary_delta_enabled and layer_idx < self.boundary_delta_first_n
-
-
-def _build_canon_layer(dim: int, canon_settings: CanonSettings) -> "CanonLayer":
-    return CanonLayer(dim, **canon_settings.layer_kwargs())
 
 
 def sinkhorn_log(logits, num_iters=10, tau=0.05):
@@ -1453,6 +1315,19 @@ class CanonLayer(nn.Module):
         return x + y if self.residual else y
 
 
+def _canon_layer_kwargs(canon_config: dict | None) -> dict:
+    canon_config = canon_config or {}
+    return dict(
+        kernel=int(canon_config.get("kernel", 4)),
+        bias=bool(canon_config.get("bias", False)),
+        activation=bool(canon_config.get("activation", False)),
+        residual=bool(canon_config.get("residual", True)),
+        delta_gate=bool(canon_config.get("delta_gate", False)),
+        delta_gate_init=float(canon_config.get("delta_gate_init", -4.0)),
+        use_fast_conv1d=bool(canon_config.get("use_fast_conv1d", True)),
+    )
+
+
 class VectorSmearGate(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -1507,7 +1382,8 @@ class CausalSelfAttention(nn.Module):
         value_embed_gate_scale: float,
         low_rank_config: dict | None = None,
         qk_gain_init: float = 1.0,
-        canon_settings: CanonSettings | None = None,
+        canon_config: dict | None = None,
+        xsa_config: dict | None = None,
         use_xsa: bool = False,
         use_canon_b: bool = False,
     ):
@@ -1532,7 +1408,8 @@ class CausalSelfAttention(nn.Module):
         self.use_low_rank = low_rank_config["enabled"] and low_rank_config["apply_attention"]
         self.use_factorized = self.use_low_rank and self.low_rank_mode == "factorized"
         self.use_noble = self.use_low_rank and self.low_rank_mode == "noble"
-        canon_settings = canon_settings or CanonSettings()
+        canon_config = canon_config or {}
+        xsa_config = xsa_config or {}
 
         assert hdim == dim, "num_heads * head_dim must equal model_dim"
         if self.use_low_rank and self.enable_gqa:
@@ -1602,10 +1479,10 @@ class CausalSelfAttention(nn.Module):
             self.qkv_noble = None
             self.o_noble = None
 
-        self.q_gain = _set_param_metadata(
-            nn.Parameter(torch.full((num_heads,), float(qk_gain_init), dtype=torch.float32)),
-            "q_gain",
-        )
+        self.q_gain = nn.Parameter(torch.full((num_heads,), float(qk_gain_init), dtype=torch.float32))
+        self.q_gain.label = "q_gain"
+        self.q_gain.lr_mul = 1.0
+        self.q_gain.wd_mul = 0.0
 
         # Sparse gated attention (from train_gpt.py @classiclarryd)
         gate_input_dim = gating_config["gate_input_dim"]
@@ -1623,16 +1500,21 @@ class CausalSelfAttention(nn.Module):
             self.value_embed_gate = None
 
         self.use_xsa = bool(use_xsa)
-        if self.use_xsa and canon_settings.xsa_learnable_gate:
-            self.xsa_gate = _set_param_metadata(
-                nn.Parameter(torch.tensor(canon_settings.xsa_gate_init, dtype=torch.float32)),
-                "xsa_gate",
+        if self.use_xsa and xsa_config.get("learnable_gate", False):
+            self.xsa_gate = nn.Parameter(
+                torch.tensor(float(xsa_config.get("gate_init", 2.0)), dtype=torch.float32)
             )
+            self.xsa_gate.label = "xsa_gate"
+            self.xsa_gate.lr_mul = 1.0
+            self.xsa_gate.wd_mul = 0.0
         else:
             self.register_parameter("xsa_gate", None)
 
         if use_canon_b:
-            self.canon_b = _build_canon_layer(self.qkv_dim, canon_settings)
+            self.canon_b = CanonLayer(
+                self.qkv_dim,
+                **_canon_layer_kwargs(canon_config),
+            )
         else:
             self.canon_b = None
 
@@ -1860,10 +1742,13 @@ class Block(nn.Module):
         residual_connection: nn.Module = None,
         qk_gain_init: float = 1.0,
         ln_scale: bool = False,
-        canon_settings: CanonSettings | None = None,
+        canon_config: dict | None = None,
+        xsa_config: dict | None = None,
+        boundary_delta_config: dict | None = None,
         canon_set: str = "",
         use_xsa: bool = False,
         use_boundary_delta: bool = False,
+        use_resid_mix: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -1871,9 +1756,11 @@ class Block(nn.Module):
         gating_config = gating_config or {}
         value_embed_layers = value_embed_layers or []
         low_rank_config = low_rank_config or {}
-        canon_settings = canon_settings or CanonSettings()
-        self.canon_enabled = canon_settings.enabled
-        self.use_resid_mix = self.canon_enabled and canon_settings.use_resid_mix
+        canon_config = canon_config or {}
+        xsa_config = xsa_config or {}
+        boundary_delta_config = boundary_delta_config or {}
+        self.canon_enabled = bool(canon_set)
+        self.use_resid_mix = bool(use_resid_mix)
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
         # Skip attention of specific layers (e.g., layer 6 in train_gpt.py) by @YouJiacheng
@@ -1890,17 +1777,21 @@ class Block(nn.Module):
                 value_embed_gate_scale=value_embed_gate_scale,
                 low_rank_config=low_rank_config,
                 qk_gain_init=qk_gain_init,
-                canon_settings=canon_settings,
+                canon_config=canon_config,
+                xsa_config=xsa_config,
                 use_xsa=use_xsa,
-                use_canon_b=self.canon_enabled and "B" in canon_set,
+                use_canon_b="B" in canon_set,
             )
         else:
             self.attn = None
 
         hidden_transform = None
-        if self.canon_enabled and "D" in canon_set:
+        if "D" in canon_set:
             hidden_dim = int(ffn_dim if ffn_dim is not None else 4 * dim)
-            hidden_transform = _build_canon_layer(hidden_dim, canon_settings)
+            hidden_transform = CanonLayer(
+                hidden_dim,
+                **_canon_layer_kwargs(canon_config),
+            )
 
         # FFN via factory — mlp_type selects the variant.
         self.mlp = _create_mlp(
@@ -1922,38 +1813,40 @@ class Block(nn.Module):
         self.canon_a = None
         self.canon_c = None
 
+        if self.use_resid_mix:
+            self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+            self.resid_mix.label = "resid_mix"
+            self.resid_mix.lr_mul = 1.0
+            self.resid_mix.wd_mul = 0.0
+
         if self.canon_enabled:
-            self.attn_scale = _set_param_metadata(
-                nn.Parameter(torch.ones(dim, dtype=torch.float32)),
-                "attn_scale",
-            )
-            self.mlp_scale = _set_param_metadata(
-                nn.Parameter(torch.ones(dim, dtype=torch.float32)),
-                "mlp_scale",
-            )
+            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.attn_scale.label = "attn_scale"
+            self.attn_scale.lr_mul = 1.0
+            self.attn_scale.wd_mul = 0.0
 
-            if self.use_resid_mix:
-                self.resid_mix = _set_param_metadata(
-                    nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float()),
-                    "resid_mix",
-                )
-
-            if use_boundary_delta:
-                self.boundary_delta_gate = _set_param_metadata(
-                    nn.Parameter(
-                        torch.full(
-                            canon_settings.boundary_delta_gate_shape(dim),
-                            canon_settings.boundary_delta_gate_init,
-                            dtype=torch.float32,
-                        )
-                    ),
-                    "boundary_delta_gate",
-                )
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.mlp_scale.label = "mlp_scale"
+            self.mlp_scale.lr_mul = 1.0
+            self.mlp_scale.wd_mul = 0.0
 
             if "A" in canon_set:
-                self.canon_a = _build_canon_layer(dim, canon_settings)
+                self.canon_a = CanonLayer(dim, **_canon_layer_kwargs(canon_config))
             if "C" in canon_set:
-                self.canon_c = _build_canon_layer(dim, canon_settings)
+                self.canon_c = CanonLayer(dim, **_canon_layer_kwargs(canon_config))
+
+        if use_boundary_delta:
+            gate_shape = (dim,) if boundary_delta_config.get("gate_vector", False) else (1,)
+            self.boundary_delta_gate = nn.Parameter(
+                torch.full(
+                    gate_shape,
+                    float(boundary_delta_config.get("gate_init", -4.0)),
+                    dtype=torch.float32,
+                )
+            )
+            self.boundary_delta_gate.label = "boundary_delta_gate"
+            self.boundary_delta_gate.lr_mul = 1.0
+            self.boundary_delta_gate.wd_mul = 0.0
 
     def _forward_impl(
         self,
@@ -1974,21 +1867,18 @@ class Block(nn.Module):
         residual = x
         if self.resid_mix is not None:
             if x0 is None:
-                raise ValueError("Canon resid_mix requires x0 to be passed into Block.forward")
+                raise ValueError("resid_mix requires x0 to be passed into Block.forward")
             mix = self.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
         if self.attn is not None:
-            if self.canon_enabled:
-                attn_input = norm(x) * self.ln_scale_factor
-                if self.boundary_delta_gate is not None:
-                    x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
-                    gate = torch.sigmoid(self.boundary_delta_gate.to(dtype=x.dtype))
-                    attn_input = attn_input + (x - x_prev) * gate.view(1, 1, -1)
-                if self.canon_a is not None:
-                    attn_input = self.canon_a(attn_input)
-            else:
-                attn_input = norm(x)
+            attn_input = norm(x) * self.ln_scale_factor if self.canon_enabled else norm(x)
+            if self.boundary_delta_gate is not None:
+                x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+                gate = torch.sigmoid(self.boundary_delta_gate.to(dtype=x.dtype))
+                attn_input = attn_input + (x - x_prev) * gate.view(1, 1, -1)
+            if self.canon_a is not None:
+                attn_input = self.canon_a(attn_input)
 
             attn_out = self.attn(
                 attn_input,
@@ -2009,10 +1899,10 @@ class Block(nn.Module):
 
         if self.canon_enabled:
             mlp_input = norm(x) * self.ln_scale_factor
-            if self.canon_c is not None:
-                mlp_input = self.canon_c(mlp_input)
         else:
             mlp_input = norm(x) if getattr(self.mlp, "needs_external_norm", True) else x
+        if self.canon_c is not None:
+            mlp_input = self.canon_c(mlp_input)
 
         mlp_out = self.mlp(mlp_input)
         if self.mlp_scale is not None:
@@ -2081,6 +1971,12 @@ class GPT(nn.Module):
         rope_config: dict = None,
         embed_config: dict = None,
         canon_config: dict = None,
+        smear_config: dict = None,
+        skip_topology_config: dict = None,
+        xsa_config: dict = None,
+        boundary_delta_config: dict = None,
+        resid_mix_config: dict = None,
+        bigram_config: dict = None,
         low_rank_config: dict = None,
         residual_connection_config: dict = None,
         wd_multipliers: dict = None,
@@ -2094,6 +1990,13 @@ class GPT(nn.Module):
         self.skip_config = skip_config or {}
         self.rope_config = rope_config or {}
         self.embed_config = embed_config or {}
+        self.canon_config = canon_config or {}
+        self.smear_config = smear_config or {}
+        self.skip_topology_config = skip_topology_config or {}
+        self.xsa_config = xsa_config or {}
+        self.boundary_delta_config = boundary_delta_config or {}
+        self.resid_mix_config = resid_mix_config or {}
+        self.bigram_config = bigram_config or {}
         self.low_rank_config = _resolve_low_rank_config(low_rank_config)
         self.low_rank_pairs: list[tuple[Tensor, Tensor]] = []
 
@@ -2149,31 +2052,67 @@ class GPT(nn.Module):
         self.model_dim = model_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.canon_settings = CanonSettings.from_config(canon_config, num_layers=num_layers)
+
+        canon_enabled = bool(self.canon_config.get("enabled", False))
+        canon_set = str(self.canon_config.get("set", "ABCD")).upper()
+        canon_first_n = int(self.canon_config.get("first_n", 0))
+        canon_last_n = int(self.canon_config.get("last_n", 0))
+        canon_layers = tuple(
+            int(layer) for layer in self.canon_config.get("layers", ()) if str(layer).strip()
+        )
+        smear_mode = str(self.smear_config.get("mode", "ramen")).lower()
+        skip_topology_mode = str(self.skip_topology_config.get("mode", "ramen")).lower()
+        xsa_enabled = bool(self.xsa_config.get("enabled", False))
+        xsa_last_n = int(self.xsa_config.get("last_n", 0))
+        boundary_delta_enabled = bool(self.boundary_delta_config.get("enabled", False))
+        boundary_delta_first_n = int(self.boundary_delta_config.get("first_n", 0))
+        use_resid_mix = bool(self.resid_mix_config.get("enabled", False))
+        bigram_enabled = bool(self.bigram_config.get("enabled", False))
+        bigram_vocab_size = int(self.bigram_config.get("vocab_size", 0))
+        bigram_dim = int(self.bigram_config.get("dim", 0))
 
         if num_heads % num_kv_heads != 0:
             raise ValueError("model_config.num_heads must be divisible by model_config.num_kv_heads")
-        if self.canon_settings.enabled and mlp_type != "default":
-            raise ValueError("canon_config.enabled=True currently requires model_config.mlp_type='default'")
+        if canon_enabled and "D" in canon_set and mlp_type != "default":
+            raise ValueError("Canon D currently requires model_config.mlp_type='default'")
         if logits_softcap_mode not in {"sigmoid", "tanh"}:
             raise ValueError(
                 f"model_config.logits_softcap_mode must be 'sigmoid' or 'tanh', got {logits_softcap_mode!r}"
             )
         if logits_tanh_cap <= 0:
             raise ValueError("model_config.logits_tanh_cap must be > 0")
+        if xsa_last_n < 0 or xsa_last_n > num_layers:
+            raise ValueError("xsa_config.last_n must be between 0 and model_config.num_layers")
+        if smear_mode not in {"ramen", "canon_vector"}:
+            raise ValueError("smear_config.mode must be 'ramen' or 'canon_vector'")
+        if skip_topology_mode not in {"ramen", "canon_unet"}:
+            raise ValueError("skip_topology_config.mode must be 'ramen' or 'canon_unet'")
+        if canon_first_n < 0 or canon_last_n < 0:
+            raise ValueError("canon_config.first_n and canon_config.last_n must be >= 0")
+        if canon_first_n > num_layers or canon_last_n > num_layers:
+            raise ValueError("canon_config.first_n/last_n cannot exceed model_config.num_layers")
+        if boundary_delta_first_n < 0 or boundary_delta_first_n > num_layers:
+            raise ValueError(
+                "boundary_delta_config.first_n must be between 0 and model_config.num_layers"
+            )
+        canon_layers_uniq = tuple(dict.fromkeys(canon_layers))
+        if any(layer < 1 or layer > num_layers for layer in canon_layers_uniq):
+            raise ValueError(
+                f"canon_config.layers must use 1-based indices within [1, {num_layers}], got {canon_layers_uniq}"
+            )
+        explicit_canon_layers = {layer - 1 for layer in canon_layers_uniq} if canon_layers_uniq else None
+        use_scoped_canon = explicit_canon_layers is not None or canon_first_n > 0 or canon_last_n > 0
 
         # Positional embedding (YaRN, HalfRoPE, StandardRoPE, or none)
         self.pos_emb = create_positional_embedding(self.rope_config, head_dim, max_seq_len, block_size)
 
         # Smear gate: shift token embeddings forward (from train_gpt.py @classiclarryd)
         gate_input_dim = self.gating_config["gate_input_dim"]
-        if self.canon_settings.enabled and self.canon_settings.smear_mode == "canon_vector":
+        if smear_mode == "canon_vector":
             self.canon_smear = VectorSmearGate(model_dim)
-            _set_param_metadata(
-                self.canon_smear.gate,
-                "smear_gate",
-                lr_mul=lr_multipliers["smear_gate"],
-            )
+            self.canon_smear.gate.label = "smear_gate"
+            self.canon_smear.gate.lr_mul = lr_multipliers["smear_gate"]
+            self.canon_smear.gate.wd_mul = 0.0
             self.smear_gate = None
         elif self.gating_config.get("use_smear_gate", True):
             self.smear_gate = CastedLinear(gate_input_dim, 1)
@@ -2185,7 +2124,7 @@ class GPT(nn.Module):
             self.canon_smear = None
 
         # Skip gate (from train_gpt.py)
-        if self.canon_settings.skip_topology == "ramen" and self.gating_config.get("use_skip_gate", True):
+        if skip_topology_mode == "ramen" and self.gating_config.get("use_skip_gate", True):
             self.skip_gate = CastedLinear(gate_input_dim, 1)
             self.skip_gate.weight.label = "skip_gate"
             self.skip_gate.weight.lr_mul = lr_multipliers["skip_gate"]
@@ -2203,15 +2142,15 @@ class GPT(nn.Module):
             nn.init.zeros_(embed.weight)
             embed.weight.label = "value_embed"
 
-        if self.canon_settings.enabled and self.canon_settings.bigram_vocab_size > 0:
-            if self.canon_settings.bigram_dim <= 0:
-                raise ValueError("canon_config.bigram_dim must be > 0 when bigram_vocab_size is enabled")
-            self.bigram = BigramHashEmbedding(
-                self.canon_settings.bigram_vocab_size,
-                self.canon_settings.bigram_dim,
-                model_dim,
-            )
-            _set_param_metadata(self.bigram.scale, "bigram_scale")
+        if bigram_enabled:
+            if bigram_vocab_size <= 0:
+                raise ValueError("bigram_config.vocab_size must be > 0 when bigram_config.enabled=True")
+            if bigram_dim <= 0:
+                raise ValueError("bigram_config.dim must be > 0 when bigram_config.enabled=True")
+            self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim)
+            self.bigram.scale.label = "bigram_scale"
+            self.bigram.scale.lr_mul = 1.0
+            self.bigram.scale.wd_mul = 0.0
         else:
             self.bigram = None
 
@@ -2219,6 +2158,19 @@ class GPT(nn.Module):
         value_embed_layers = attention_pattern_config["value_embed_layers"]
         blocks = []
         for i in range(num_layers):
+            if canon_enabled:
+                if explicit_canon_layers is not None:
+                    use_layer_canon = i in explicit_canon_layers
+                else:
+                    use_layer_canon = (
+                        not use_scoped_canon or i < canon_first_n or i >= num_layers - canon_last_n
+                    )
+            else:
+                use_layer_canon = False
+            layer_canon_set = canon_set if use_layer_canon else ""
+            use_xsa = xsa_enabled and i >= max(0, num_layers - xsa_last_n)
+            use_boundary_delta = boundary_delta_enabled and i < boundary_delta_first_n
+
             blocks.append(
                 Block(
                     model_dim,
@@ -2240,10 +2192,13 @@ class GPT(nn.Module):
                     mlp_kwargs=mlp_kwargs,
                     qk_gain_init=qk_gain_init,
                     ln_scale=ln_scale,
-                    canon_settings=self.canon_settings,
-                    canon_set=self.canon_settings.layer_set_for(i, num_layers),
-                    use_xsa=self.canon_settings.uses_xsa(i, num_layers),
-                    use_boundary_delta=self.canon_settings.uses_boundary_delta(i),
+                    canon_config=self.canon_config,
+                    xsa_config=self.xsa_config,
+                    boundary_delta_config=self.boundary_delta_config,
+                    canon_set=layer_canon_set,
+                    use_xsa=use_xsa,
+                    use_boundary_delta=use_boundary_delta,
+                    use_resid_mix=use_resid_mix,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
@@ -2253,14 +2208,16 @@ class GPT(nn.Module):
                 self.low_rank_pairs.extend(block.attn.low_rank_pairs)
             self.low_rank_pairs.extend(getattr(block.mlp, "low_rank_pairs", []))
 
-        if self.canon_settings.enabled and self.canon_settings.skip_topology == "canon_unet":
+        if skip_topology_mode == "canon_unet":
             self.num_encoder_layers = num_layers // 2
             self.num_decoder_layers = num_layers - self.num_encoder_layers
             self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-            self.skip_weights = _set_param_metadata(
-                nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32)),
-                "skip_weights",
+            self.skip_weights = nn.Parameter(
+                torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32)
             )
+            self.skip_weights.label = "skip_weights"
+            self.skip_weights.lr_mul = 1.0
+            self.skip_weights.wd_mul = 0.0
         else:
             self.num_encoder_layers = 0
             self.num_decoder_layers = 0
@@ -2344,6 +2301,8 @@ class GPT(nn.Module):
         self._logits_softcap_mode = logits_softcap_mode
         self._logits_tanh_cap = logits_tanh_cap
         self._model_wd_multipliers = wd_multipliers
+        self._skip_topology_mode = skip_topology_mode
+        self._use_resid_mix = use_resid_mix
 
         (
             self._residual_connection_mode,
@@ -2355,8 +2314,8 @@ class GPT(nn.Module):
             model_dim,
         )
 
-        if self.canon_settings.use_resid_mix and self._residual_connection_init is not None:
-            raise ValueError("canon_config.use_resid_mix is not supported with residual_connection_config modes")
+        if self._use_resid_mix and self._residual_connection_init is not None:
+            raise ValueError("resid_mix_config.enabled is not supported with residual_connection_config modes")
 
         if self._residual_connection_init is not None:
             for i, block in enumerate(self.blocks):
@@ -2439,190 +2398,6 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def _build_value_embeddings(self, input_seq: Tensor) -> list[Tensor | None]:
-        num_layers = len(self.blocks)
-        if len(self.value_embeds) == 0:
-            return [None] * num_layers
-
-        ve_computed = [value_embed(input_seq) for value_embed in self.value_embeds]
-        ve = (
-            [ve_computed[i] for i in self._value_embed_head_indices]
-            + [None] * (num_layers - self._value_embed_mid_layer_count)
-            + [ve_computed[i] for i in self._value_embed_tail_indices]
-        )
-        assert len(ve) == num_layers
-        return ve
-
-    def _build_attention_layout(
-        self,
-        input_seq: Tensor,
-        *,
-        is_decode: bool,
-        cache_docs: Tensor | None,
-        sliding_window_num_blocks: Tensor,
-    ) -> tuple[Tensor, list, list[bool]]:
-        requires_mask = [block.attn is not None for block in self.blocks]
-        docs: Tensor
-        if is_decode:
-            assert cache_docs is not None
-            current_doc = cache_docs[-1] + (input_seq[-1] == self._eos_token_id).to(cache_docs.dtype)
-            docs = current_doc.view(1)
-        else:
-            docs = (input_seq == self._eos_token_id).cumsum(0)
-
-        long_bm = short_bm = None
-        if any(requires_mask) and not is_decode:
-            long_bm, short_bm = self.create_blockmasks(docs, sliding_window_num_blocks)
-
-        block_masks = []
-        key_offsets = []
-        for needs_mask, char in zip(requires_mask, self.attention_pattern_config["block_mask_pattern"]):
-            if is_decode or not needs_mask:
-                block_masks.append(None)
-                key_offsets.append(False)
-            elif char == "L":
-                block_masks.append(long_bm)
-                key_offsets.append(True)
-            elif char == "S":
-                block_masks.append(short_bm)
-                key_offsets.append(False)
-            elif char == "N":
-                block_masks.append(None)
-                key_offsets.append(False)
-            else:
-                raise ValueError(
-                    f"Invalid block mask pattern character: {char}. Use 'L', 'S', or 'N'."
-                )
-
-        assert len(block_masks) == len(self.blocks)
-        return docs, block_masks, key_offsets
-
-    def _embed_tokens(self, input_seq: Tensor) -> Tensor:
-        if self.split_embed and self.embed is not None:
-            x = self.embed(input_seq)
-        else:
-            x = F.embedding(input_seq, self.lm_head.weight)
-        if self.bigram is not None:
-            x = x + self.bigram(input_seq)
-        return x
-
-    def _apply_input_smear(
-        self,
-        x: Tensor,
-        cache_smear_state: Tensor | None,
-    ) -> tuple[Tensor, Tensor, Tensor | None]:
-        smear_lambda = self.scalars[3 * self.num_layers]
-        x_raw = x
-        smear_state_to_cache = None
-
-        if self.canon_smear is not None:
-            x = norm(x[None])
-            pre_smear_x = x
-            prev_state = cache_smear_state if x.shape[1] == 1 and cache_smear_state is not None else None
-            x = self.canon_smear(x, prev_state=prev_state)
-            smear_state_to_cache = pre_smear_x[0, -1].detach()
-            return x, x, smear_state_to_cache
-
-        if self.smear_gate is not None:
-            gate_width = self.smear_gate.weight.size(-1)
-            if x.shape[0] == 1 and cache_smear_state is not None:
-                smear_gate_out = torch.sigmoid(self.smear_gate(x[:, :gate_width]))
-                x = x_raw + (smear_lambda * smear_gate_out) * cache_smear_state.view(1, -1)
-            else:
-                smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :gate_width]))
-                x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
-            smear_state_to_cache = x_raw[-1].detach()
-
-        x = norm(x[None])
-        return x, x, smear_state_to_cache
-
-    def _apply_block(
-        self,
-        layer_idx: int,
-        hidden: Tensor,
-        *,
-        x0: Tensor,
-        ve: list[Tensor | None],
-        sa_lambdas: Tensor,
-        block_masks: list,
-        cos: Tensor,
-        sin: Tensor,
-        attn_scale: float,
-        docs: Tensor,
-        key_offsets: list[bool],
-        cache_layers: list[dict] | None,
-        cache_docs: Tensor | None,
-    ) -> Tensor:
-        if not self.canon_settings.use_resid_mix:
-            if layer_idx == self._residual_first_layer_index:
-                hidden = (self.scalars[0] + self.x0_lambdas[0]) * hidden
-            else:
-                hidden = self.scalars[layer_idx] * hidden + self.x0_lambdas[layer_idx] * x0
-
-        return self.blocks[layer_idx](
-            hidden,
-            ve[layer_idx],
-            sa_lambdas[layer_idx],
-            block_masks[layer_idx],
-            cos,
-            sin,
-            attn_scale,
-            docs,
-            key_offsets[layer_idx],
-            kv_cache=cache_layers[layer_idx] if cache_layers is not None else None,
-            cache_docs=cache_docs,
-            x0=x0,
-        )
-
-    def _run_canon_unet_blocks(self, x: Tensor, apply_block: Callable[[int, Tensor], Tensor]) -> Tensor:
-        skip_connections = []
-        for i in range(self.num_encoder_layers):
-            x = apply_block(i, x)
-            skip_connections.append(x)
-        for i in range(self.num_decoder_layers):
-            if skip_connections and self.skip_weights is not None:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_connections.pop()
-            x = apply_block(self.num_encoder_layers + i, x)
-        return x
-
-    def _run_ramen_blocks(
-        self,
-        x: Tensor,
-        x0: Tensor,
-        apply_block: Callable[[int, Tensor], Tensor],
-        *,
-        skip_in_layers: list[int],
-        skip_out_layers: list[int],
-        backout_layer: int,
-        backout_lambda: Tensor,
-        skip_lambda: Tensor,
-    ) -> Tensor:
-        skip_connections = []
-        x_backout = None
-
-        for i in range(len(self.blocks)):
-            if i in skip_out_layers and skip_connections:
-                if self.skip_gate is not None:
-                    skip_gate_out = (
-                        torch.sigmoid(skip_lambda)
-                        * self._skip_gate_scale
-                        * torch.sigmoid(self.skip_gate(x0[..., : self.skip_gate.weight.size(-1)]))
-                    )
-                    x = x + skip_gate_out * skip_connections.pop()
-                else:
-                    x = x + skip_connections.pop()
-
-            x = apply_block(i, x)
-
-            if i in skip_in_layers:
-                skip_connections.append(x)
-            if i == backout_layer:
-                x_backout = x
-
-        if x_backout is not None:
-            x = x - backout_lambda * x_backout
-        return x
-
     def _compute_mtp_loss(self, logits_flat: Tensor, target_seq: Tensor, mtp_weights: Tensor):
         """Compute multi-token prediction loss with weighted offsets.
 
@@ -2687,17 +2462,78 @@ class GPT(nn.Module):
         skip_out_layers = self.skip_config.get("skip_out_layers", [])
         backout_layer = self.skip_config.get("backout_layer", -1)
 
-        ve = self._build_value_embeddings(input_seq)
-        docs, block_masks, key_offsets = self._build_attention_layout(
-            input_seq,
-            is_decode=is_decode,
-            cache_docs=cache_docs,
-            sliding_window_num_blocks=sliding_window_num_blocks,
-        )
-        x, x0, smear_state_to_cache = self._apply_input_smear(
-            self._embed_tokens(input_seq),
-            cache_smear_state,
-        )
+        if len(self.value_embeds) > 0:
+            ve_computed = [value_embed(input_seq) for value_embed in self.value_embeds]
+            ve = (
+                [ve_computed[i] for i in self._value_embed_head_indices]
+                + [None] * (len(self.blocks) - self._value_embed_mid_layer_count)
+                + [ve_computed[i] for i in self._value_embed_tail_indices]
+            )
+            assert len(ve) == len(self.blocks)
+        else:
+            ve = [None] * len(self.blocks)
+
+        requires_mask = [block.attn is not None for block in self.blocks]
+        if is_decode:
+            assert cache_docs is not None
+            current_doc = cache_docs[-1] + (input_seq[-1] == self._eos_token_id).to(cache_docs.dtype)
+            docs = current_doc.view(1)
+        else:
+            docs = (input_seq == self._eos_token_id).cumsum(0)
+
+        if any(requires_mask) and not is_decode:
+            long_bm, short_bm = self.create_blockmasks(docs, sliding_window_num_blocks)
+        else:
+            long_bm = short_bm = None
+
+        block_masks = []
+        key_offsets = []
+        for needs_mask, char in zip(requires_mask, self.attention_pattern_config["block_mask_pattern"]):
+            if is_decode or not needs_mask:
+                block_masks.append(None)
+                key_offsets.append(False)
+            elif char == "L":
+                block_masks.append(long_bm)
+                key_offsets.append(True)
+            elif char == "S":
+                block_masks.append(short_bm)
+                key_offsets.append(False)
+            elif char == "N":
+                block_masks.append(None)
+                key_offsets.append(False)
+            else:
+                raise ValueError(
+                    f"Invalid block mask pattern character: {char}. Use 'L', 'S', or 'N'."
+                )
+
+        if self.split_embed and self.embed is not None:
+            x = self.embed(input_seq)
+        else:
+            x = F.embedding(input_seq, self.lm_head.weight)
+        if self.bigram is not None:
+            x = x + self.bigram(input_seq)
+
+        smear_lambda = self.scalars[3 * self.num_layers]
+        x_raw = x
+        smear_state_to_cache = None
+        if self.canon_smear is not None:
+            x = norm(x[None])
+            pre_smear_x = x
+            prev_state = cache_smear_state if x.shape[1] == 1 and cache_smear_state is not None else None
+            x = self.canon_smear(x, prev_state=prev_state)
+            smear_state_to_cache = pre_smear_x[0, -1].detach()
+        else:
+            if self.smear_gate is not None:
+                gate_width = self.smear_gate.weight.size(-1)
+                if x.shape[0] == 1 and cache_smear_state is not None:
+                    smear_gate_out = torch.sigmoid(self.smear_gate(x[:, :gate_width]))
+                    x = x_raw + (smear_lambda * smear_gate_out) * cache_smear_state.view(1, -1)
+                else:
+                    smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :gate_width]))
+                    x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
+                smear_state_to_cache = x_raw[-1].detach()
+            x = norm(x[None])
+        x0 = x
 
         x = self._residual_connection_expand(x)
         x0 = self._residual_connection_expand(x0)
@@ -2709,34 +2545,60 @@ class GPT(nn.Module):
         cos, sin = self.pos_emb.cos, self.pos_emb.sin
         attn_scale = self.pos_emb.attn_scale
 
-        apply_block = partial(
-            self._apply_block,
-            x0=x0,
-            ve=ve,
-            sa_lambdas=sa_lambdas,
-            block_masks=block_masks,
-            cos=cos,
-            sin=sin,
-            attn_scale=attn_scale,
-            docs=docs,
-            key_offsets=key_offsets,
-            cache_layers=cache_layers,
-            cache_docs=cache_docs,
-        )
-
-        if self.canon_settings.skip_topology == "canon_unet":
-            x = self._run_canon_unet_blocks(x, apply_block)
-        else:
-            x = self._run_ramen_blocks(
-                x,
-                x0,
-                apply_block,
-                skip_in_layers=skip_in_layers,
-                skip_out_layers=skip_out_layers,
-                backout_layer=backout_layer,
-                backout_lambda=backout_lambda,
-                skip_lambda=skip_lambda,
+        def apply_block(layer_idx: int, hidden: Tensor) -> Tensor:
+            if not self._use_resid_mix:
+                if layer_idx == self._residual_first_layer_index:
+                    hidden = (self.scalars[0] + self.x0_lambdas[0]) * hidden
+                else:
+                    hidden = self.scalars[layer_idx] * hidden + self.x0_lambdas[layer_idx] * x0
+            return self.blocks[layer_idx](
+                hidden,
+                ve[layer_idx],
+                sa_lambdas[layer_idx],
+                block_masks[layer_idx],
+                cos,
+                sin,
+                attn_scale,
+                docs,
+                key_offsets[layer_idx],
+                kv_cache=cache_layers[layer_idx] if cache_layers is not None else None,
+                cache_docs=cache_docs,
+                x0=x0,
             )
+
+        skip_connections = []
+        x_backout = None
+
+        if self._skip_topology_mode == "canon_unet":
+            for i in range(self.num_encoder_layers):
+                x = apply_block(i, x)
+                skip_connections.append(x)
+            for i in range(self.num_decoder_layers):
+                if skip_connections and self.skip_weights is not None:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_connections.pop()
+                x = apply_block(self.num_encoder_layers + i, x)
+        else:
+            for i in range(len(self.blocks)):
+                if i in skip_out_layers and skip_connections:
+                    if self.skip_gate is not None:
+                        skip_gate_out = (
+                            torch.sigmoid(skip_lambda)
+                            * self._skip_gate_scale
+                            * torch.sigmoid(self.skip_gate(x0[..., : self.skip_gate.weight.size(-1)]))
+                        )
+                        x = x + skip_gate_out * skip_connections.pop()
+                    else:
+                        x = x + skip_connections.pop()
+
+                x = apply_block(i, x)
+
+                if i in skip_in_layers:
+                    skip_connections.append(x)
+                if i == backout_layer:
+                    x_backout = x
+
+            if x_backout is not None:
+                x = x - backout_lambda * x_backout
 
         x = self._residual_connection_reduce(x)
         x = norm(x)

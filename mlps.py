@@ -598,7 +598,8 @@ class DefaultMLP(nn.Module):
         self.use_noble = self.use_low_rank and self.low_rank_mode == "noble"
         self.low_rank_pairs: list[tuple[Tensor, Tensor]] = []
 
-        self.is_glu, self.activation_fn = _get_activation_spec(activation)
+        self.activation_name = _normalize_activation_name(activation)
+        self.is_glu, self.activation_fn = _get_activation_spec(self.activation_name)
         if hidden_transform is not None and self.is_glu:
             raise ValueError("DefaultMLP hidden_transform is only supported for non-GLU activations.")
         self.hidden_transform = hidden_transform
@@ -713,9 +714,15 @@ class DefaultMLP(nn.Module):
             x_gate, x_sig = x.chunk(2, dim=-1)
             x = self.activation_fn(x_gate) * x_sig
         else:
-            x = self.activation_fn(x)
-            if self.hidden_transform is not None:
+            if self.hidden_transform is not None and self.activation_name == "relu_squared":
+                # Canon D in train_gpt_canon.py is applied after ReLU and before squaring.
+                x = F.relu(x)
                 x = self.hidden_transform(x)
+                x = x.square()
+            else:
+                x = self.activation_fn(x)
+                if self.hidden_transform is not None:
+                    x = self.hidden_transform(x)
         proj_input = x
         if self.use_factorized:
             x = self.c_proj(proj_input)

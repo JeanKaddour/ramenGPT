@@ -87,19 +87,39 @@ canon_config = dict(
     residual=True,
     delta_gate=False,
     delta_gate_init=-4.0,
-    xsa_last_n=0,
-    xsa_learnable_gate=False,
-    xsa_gate_init=2.0,
-    boundary_delta_enabled=False,
-    boundary_delta_first_n=0,
-    boundary_delta_gate_vector=False,
-    boundary_delta_gate_init=-4.0,
-    use_resid_mix=False,
-    smear_mode="ramen",
-    skip_topology="ramen",
-    bigram_vocab_size=0,
-    bigram_dim=0,
     use_fast_conv1d=True,
+)
+
+smear_config = dict(
+    mode="ramen",
+)
+
+skip_topology_config = dict(
+    mode="ramen",
+)
+
+xsa_config = dict(
+    enabled=False,
+    last_n=0,
+    learnable_gate=False,
+    gate_init=2.0,
+)
+
+boundary_delta_config = dict(
+    enabled=False,
+    first_n=0,
+    gate_vector=False,
+    gate_init=-4.0,
+)
+
+resid_mix_config = dict(
+    enabled=False,
+)
+
+bigram_config = dict(
+    enabled=False,
+    vocab_size=0,
+    dim=0,
 )
 
 # Data layout matches the FineWeb shards used by baseline configs.

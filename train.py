@@ -614,6 +614,12 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     rope_config = getattr(config, "rope_config", None)
     embed_config = getattr(config, "embed_config", None)
     canon_config = getattr(config, "canon_config", None)
+    smear_config = getattr(config, "smear_config", None)
+    skip_topology_config = getattr(config, "skip_topology_config", None)
+    xsa_config = getattr(config, "xsa_config", None)
+    boundary_delta_config = getattr(config, "boundary_delta_config", None)
+    resid_mix_config = getattr(config, "resid_mix_config", None)
+    bigram_config = getattr(config, "bigram_config", None)
     window_schedule_config = getattr(config, "window_schedule_config", None)
 
     # Extract gradient clipping configuration from training config
@@ -688,6 +694,12 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         rope_config=rope_config,
         embed_config=embed_config,
         canon_config=canon_config,
+        smear_config=smear_config,
+        skip_topology_config=skip_topology_config,
+        xsa_config=xsa_config,
+        boundary_delta_config=boundary_delta_config,
+        resid_mix_config=resid_mix_config,
+        bigram_config=bigram_config,
         residual_connection_config=residual_connection_config,
         wd_multipliers=wd_multipliers,
         low_rank_config=low_rank_config,
@@ -853,6 +865,12 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             **validation_inference_config,
             "low_rank_config": low_rank_config or {},
             "canon_config": canon_config or {},
+            "smear_config": smear_config or {},
+            "skip_topology_config": skip_topology_config or {},
+            "xsa_config": xsa_config or {},
+            "boundary_delta_config": boundary_delta_config or {},
+            "resid_mix_config": resid_mix_config or {},
+            "bigram_config": bigram_config or {},
             "config_file": args.config,
             "batch_size_multiple": micro_batch_size,
             "micro_batch_size": micro_batch_size,
@@ -883,6 +901,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     print(f"Logging to: {logfile}")
 
     def print_log(s, console=True):
+        os.makedirs(os.path.dirname(logfile), exist_ok=True)
         with open(logfile, "a") as f:
             if console:
                 print(s)

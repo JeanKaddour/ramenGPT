@@ -6,14 +6,38 @@ def create_optimizer(model, optimizer_config: dict, print_fn=print):
     Build optimizer state for dense and low-rank parameter groups.
     Low-rank updates are routed to a dedicated matrix optimizer when requested.
     """
-    # Collect parameter groups - keep logic centralized to match existing behavior.
-    hidden_matrix_params = [
-        p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n
-    ]
+    # Only true 2D block weights should go through matrix optimizers like Muon.
+    # Non-2D block tensors (for example Canon Conv1d weights) follow the scalar Adam path,
+    # matching the train_gpt_canon.py optimizer split.
+    hidden_matrix_params = []
+    non_matrix_block_params = []
+    for name, param in model.blocks.named_parameters():
+        if "embed" in name:
+            continue
+        if param.ndim == 2:
+            hidden_matrix_params.append(param)
+        else:
+            non_matrix_block_params.append(param)
+
     embed_params = [p for n, p in model.named_parameters() if "embed" in n and p.ndim >= 2]
-    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2 and "x0_lambda" not in n]
-    x0_lambda_params = [p for n, p in model.named_parameters() if "x0_lambda" in n]
     head_params = [model.lm_head.weight]
+    head_param_ids = {id(p) for p in head_params}
+    embed_param_ids = {id(p) for p in embed_params}
+    matrix_param_ids = {id(p) for p in hidden_matrix_params}
+    scalar_params = list(non_matrix_block_params)
+    scalar_param_ids = {id(p) for p in scalar_params}
+    x0_lambda_params = []
+    for name, param in model.named_parameters():
+        if id(param) in head_param_ids or id(param) in embed_param_ids or id(param) in matrix_param_ids:
+            continue
+        if "x0_lambda" in name:
+            x0_lambda_params.append(param)
+            continue
+        if id(param) in scalar_param_ids:
+            continue
+        if param.ndim < 2:
+            scalar_params.append(param)
+            scalar_param_ids.add(id(param))
     low_rank_pairs = getattr(model, "low_rank_pairs", [])
     low_rank_pairs = [
         (pair[0], pair[1])
