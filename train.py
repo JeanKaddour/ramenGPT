@@ -14,7 +14,7 @@ from torch import Tensor, nn
 import torch.nn.utils as nn_utils
 import tiktoken
 
-from mlps import _resolve_low_rank_config
+from model import _resolve_low_rank_config
 from model import GPT, next_multiple_of_n, set_flex_attention_kernel_options
 from optimizers import create_optimizer
 from inference import run_validation_generation
