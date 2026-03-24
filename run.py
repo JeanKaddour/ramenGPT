@@ -47,6 +47,7 @@ def _parse_args():
             "linear",
             "identity",
             "relu_squared",
+            "leaky_relu_squared",
             "gelu_squared",
             "swish_squared",
             "silu_squared",

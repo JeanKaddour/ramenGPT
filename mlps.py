@@ -474,6 +474,8 @@ def _get_activation_spec(activation: str):
         return False, lambda x: x
     if activation == "relu_squared":
         return False, lambda x: F.relu(x).square()
+    if activation == "leaky_relu_squared":
+        return False, lambda x: F.leaky_relu(x, negative_slope=0.5).square()
     if activation == "gelu_squared":
         return False, lambda x: F.gelu(x).square()
     if activation == "swish_squared":
@@ -500,6 +502,7 @@ def _get_activation_spec(activation: str):
         "linear",
         "identity",
         "relu_squared",
+        "leaky_relu_squared",
         "gelu_squared",
         "swish_squared",
         "silu_squared",
@@ -717,6 +720,10 @@ class DefaultMLP(nn.Module):
             if self.hidden_transform is not None and self.activation_name == "relu_squared":
                 # Canon D in train_gpt_canon.py is applied after ReLU and before squaring.
                 x = F.relu(x)
+                x = self.hidden_transform(x)
+                x = x.square()
+            elif self.hidden_transform is not None and self.activation_name == "leaky_relu_squared":
+                x = F.leaky_relu(x, negative_slope=0.5)
                 x = self.hidden_transform(x)
                 x = x.square()
             else:
