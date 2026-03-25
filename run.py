@@ -92,6 +92,19 @@ def _parse_args():
         help="Save checkpoints every K steps (overrides training_config.checkpoint_every; 0 disables periodic saves)",
     )
     parser.add_argument(
+        "--attn_variant",
+        type=str,
+        default=None,
+        choices=["baseline", "relational_transport", "hyper_attention"],
+        help="Attention variant to use (overrides attn_variant_config.variant)",
+    )
+    parser.add_argument("--rt_num_relations", type=int, default=None)
+    parser.add_argument("--rt_copy_frac", type=float, default=None)
+    parser.add_argument("--rt_gate_bias_init", type=float, default=None)
+    parser.add_argument("--ha_rank", type=int, default=None)
+    parser.add_argument("--ha_plain_frac", type=float, default=None)
+    parser.add_argument("--ha_activation", type=str, default=None, choices=["silu", "relu", "identity"])
+    parser.add_argument(
         "--muon_split",
         action="store_true",
         default=False,

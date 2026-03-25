@@ -620,6 +620,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
     boundary_delta_config = getattr(config, "boundary_delta_config", None)
     resid_mix_config = getattr(config, "resid_mix_config", None)
     bigram_config = getattr(config, "bigram_config", None)
+    attn_variant_config = getattr(config, "attn_variant_config", None) or {}
     window_schedule_config = getattr(config, "window_schedule_config", None)
 
     # Extract gradient clipping configuration from training config
@@ -646,6 +647,16 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
             raise ValueError("--checkpoint_every must be >= 0")
         training_config["checkpoint_every"] = args.checkpoint_every
         print(f"Override: checkpoint_every = {args.checkpoint_every}")
+
+    if getattr(args, "attn_variant", None) is not None:
+        attn_variant_config["variant"] = args.attn_variant
+        print(f"Override: attn_variant = {args.attn_variant}")
+    for _key in ("rt_num_relations", "rt_copy_frac", "rt_gate_bias_init",
+                 "ha_rank", "ha_plain_frac", "ha_activation"):
+        _val = getattr(args, _key, None)
+        if _val is not None:
+            attn_variant_config[_key] = _val
+            print(f"Override: {_key} = {_val}")
 
     if args.residual_connection_mode is not None:
         residual_connection_config = residual_connection_config or {}
@@ -703,6 +714,7 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
         residual_connection_config=residual_connection_config,
         wd_multipliers=wd_multipliers,
         low_rank_config=low_rank_config,
+        attn_variant_config=attn_variant_config,
     ).cuda()
     # Convert all weights to bfloat16 (from train_gpt.py)
     for m in model.modules():
@@ -828,10 +840,25 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                 if matrix_optimizer_type == "spectron"
                 else "no_spectron"
             )
+            # Attention variant suffix
+            _av = attn_variant_config.get("variant", "baseline")
+            if _av == "relational_transport":
+                _R = attn_variant_config.get("rt_num_relations", 2)
+                _cf = attn_variant_config.get("rt_copy_frac", 0.5)
+                _gb = attn_variant_config.get("rt_gate_bias_init", 2.0)
+                attn_variant_info = f"rt-R{_R}_cp{_cf}_gb{_gb}"
+            elif _av == "hyper_attention":
+                _r = attn_variant_config.get("ha_rank", 8)
+                _pf = attn_variant_config.get("ha_plain_frac", 0.5)
+                _act = attn_variant_config.get("ha_activation", "silu")
+                attn_variant_info = f"ha-r{_r}_pf{_pf}_{_act}"
+            else:
+                attn_variant_info = "baseline"
             wandb_run_name = (
                 f"{model_type}_{matrix_optimizer_prefix}_"
                 f"{model_size_info}_{param_info}_{seq_len_info}"
                 f"{activation_info}_{batch_info}_{residual_info}_{low_rank_info}"
+                f"_{attn_variant_info}"
             )
         else:
             wandb_run_name = logging_config["wandb_run_name"]
@@ -1588,6 +1615,25 @@ def run_training(config, args, code: str, detected_gpu_info: dict, run_id):
                     log_dict[f"mtp_weight_{i}"] = w
 
             log_dict.update(grad_norm_dict)
+
+            # Attention variant diagnostics
+            if model_type == "gpt":
+                attn_variant = getattr(model, "attn_variant_config", {}).get("variant", "baseline")
+                if attn_variant == "relational_transport":
+                    for i, blk in enumerate(model.blocks):
+                        if blk.attn is not None and hasattr(blk.attn, "rt_src_gate_bias"):
+                            sg = torch.sigmoid(blk.attn.rt_src_gate_bias)
+                            tg = torch.sigmoid(blk.attn.rt_tgt_gate_bias)
+                            log_dict[f"rt/L{i}_src_gate_mean"] = sg.mean().item()
+                            log_dict[f"rt/L{i}_tgt_gate_mean"] = tg.mean().item()
+                            log_dict[f"rt/L{i}_src_gate_std"] = sg.std().item()
+                            log_dict[f"rt/L{i}_tgt_gate_std"] = tg.std().item()
+                elif attn_variant == "hyper_attention":
+                    for i, blk in enumerate(model.blocks):
+                        if blk.attn is not None and hasattr(blk.attn, "ha_out_proj"):
+                            log_dict[f"ha/L{i}_out_proj_norm"] = blk.attn.ha_out_proj.norm().item()
+                            log_dict[f"ha/L{i}_a_proj_norm"] = blk.attn.ha_a_proj.norm().item()
+                            log_dict[f"ha/L{i}_b_proj_norm"] = blk.attn.ha_b_proj.norm().item()
 
             wandb.log(log_dict, step=step + 1)
 

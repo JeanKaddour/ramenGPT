@@ -279,6 +279,19 @@ optimizer_config = dict(
     freeze_scalars_on_transition=8,
 )
 
+attn_variant_config = dict(
+    variant="baseline",  # "baseline" | "relational_transport" | "hyper_attention"
+    # Relational Transport params
+    rt_num_relations=2,
+    rt_copy_frac=0.5,
+    rt_gate_bias_init=2.0,
+    rt_per_head_gates=False,
+    # Hyper-Attention params
+    ha_rank=8,
+    ha_plain_frac=0.5,
+    ha_activation="silu",
+)
+
 low_rank_config = dict(
     enabled=False,
     mode="factorized",

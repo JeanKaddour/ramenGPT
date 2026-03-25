@@ -2389,8 +2389,11 @@ class CausalSelfAttention(nn.Module):
         xsa_config: dict | None = None,
         use_xsa: bool = False,
         use_canon_b: bool = False,
+        attn_variant_config: dict = None,
     ):
         super().__init__()
+        attn_variant_config = attn_variant_config or {}
+        self.attn_variant = attn_variant_config.get("variant", "baseline")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -2521,6 +2524,147 @@ class CausalSelfAttention(nn.Module):
         else:
             self.canon_b = None
 
+        # --- Attention variant parameters ---
+        if self.attn_variant == "relational_transport":
+            R = int(attn_variant_config.get("rt_num_relations", 2))
+            copy_frac = float(attn_variant_config.get("rt_copy_frac", 0.5))
+            gate_bias_init = float(attn_variant_config.get("rt_gate_bias_init", 2.0))
+            self.rt_R = R
+            self.rt_copy_dim = int(head_dim * copy_frac)
+            self.rt_rel_dim = (head_dim - self.rt_copy_dim) // R
+            assert self.rt_copy_dim + R * self.rt_rel_dim == head_dim, (
+                f"head_dim={head_dim} not evenly split: copy={self.rt_copy_dim}, "
+                f"R={R}, rel_dim={self.rt_rel_dim}"
+            )
+            self.rt_src_gate_proj = nn.Parameter(torch.empty(R * num_kv_heads, dim))
+            self.rt_src_gate_proj.label = "attn"
+            self.rt_src_gate_proj.lr_mul = 1.0
+            self.rt_src_gate_proj.wd_mul = 1.0
+            self.rt_tgt_gate_proj = nn.Parameter(torch.empty(R * num_heads, dim))
+            self.rt_tgt_gate_proj.label = "attn"
+            self.rt_tgt_gate_proj.lr_mul = 1.0
+            self.rt_tgt_gate_proj.wd_mul = 1.0
+            self.rt_src_gate_bias = nn.Parameter(
+                torch.full((R * num_kv_heads,), gate_bias_init, dtype=torch.float32)
+            )
+            self.rt_src_gate_bias.label = "rt_gate"
+            self.rt_src_gate_bias.lr_mul = 1.0
+            self.rt_src_gate_bias.wd_mul = 0.0
+            self.rt_tgt_gate_bias = nn.Parameter(
+                torch.full((R * num_heads,), gate_bias_init, dtype=torch.float32)
+            )
+            self.rt_tgt_gate_bias.label = "rt_gate"
+            self.rt_tgt_gate_bias.lr_mul = 1.0
+            self.rt_tgt_gate_bias.wd_mul = 0.0
+            with torch.no_grad():
+                self.rt_src_gate_proj.uniform_(-bound, bound)
+                self.rt_tgt_gate_proj.uniform_(-bound, bound)
+
+        elif self.attn_variant == "hyper_attention":
+            r = int(attn_variant_config.get("ha_rank", 8))
+            plain_frac = float(attn_variant_config.get("ha_plain_frac", 0.5))
+            self.ha_r = r
+            self.ha_plain_dim = int(head_dim * plain_frac)
+            self.ha_hyper_dim = r * r
+            self.ha_packed_v_dim = self.ha_plain_dim + self.ha_hyper_dim
+            self.ha_activation = str(attn_variant_config.get("ha_activation", "silu"))
+            self.ha_a_proj = nn.Parameter(torch.empty(num_kv_heads * r, dim))
+            self.ha_a_proj.label = "attn"
+            self.ha_a_proj.lr_mul = 1.0
+            self.ha_a_proj.wd_mul = 1.0
+            self.ha_b_proj = nn.Parameter(torch.empty(num_kv_heads * r, dim))
+            self.ha_b_proj.label = "attn"
+            self.ha_b_proj.lr_mul = 1.0
+            self.ha_b_proj.wd_mul = 1.0
+            self.ha_z_proj = nn.Parameter(torch.empty(num_heads * r, dim))
+            self.ha_z_proj.label = "attn"
+            self.ha_z_proj.lr_mul = 1.0
+            self.ha_z_proj.wd_mul = 1.0
+            out_features = num_heads * (self.ha_plain_dim + r)
+            self.ha_out_proj = nn.Parameter(torch.zeros(dim, out_features))
+            self.ha_out_proj.label = "attn"
+            self.ha_out_proj.lr_mul = 1.0
+            self.ha_out_proj.wd_mul = 1.0
+            with torch.no_grad():
+                self.ha_a_proj.uniform_(-bound, bound)
+                self.ha_b_proj.uniform_(-bound, bound)
+                self.ha_z_proj.uniform_(-bound, bound)
+                # ha_out_proj stays zero-init
+
+    def _rt_pack_values(self, v: Tensor, x: Tensor) -> Tensor:
+        """Apply Relational Transport source gates to V before attention."""
+        B, T = v.shape[:2]
+        # Split V into copy + relational chunks along head_dim
+        v_copy = v[..., : self.rt_copy_dim]
+        v_rel = v[..., self.rt_copy_dim :].reshape(
+            B, T, self.num_kv_heads, self.rt_R, self.rt_rel_dim
+        )
+        # Source gates: sigmoid(linear(x) + bias)
+        g_s = torch.sigmoid(
+            F.linear(x, self.rt_src_gate_proj.type_as(x))
+            + self.rt_src_gate_bias.to(dtype=x.dtype)
+        ).view(B, T, self.num_kv_heads, self.rt_R, 1)
+        v_rel = v_rel * g_s
+        v_rel = v_rel.reshape(B, T, self.num_kv_heads, self.rt_R * self.rt_rel_dim)
+        return torch.cat([v_copy, v_rel], dim=-1)
+
+    def _rt_unpack_output(self, y: Tensor, x: Tensor) -> Tensor:
+        """Apply Relational Transport target gates after attention."""
+        B, _, T, _ = y.shape  # (B, H, T, head_dim)
+        y_copy = y[..., : self.rt_copy_dim]
+        y_rel = y[..., self.rt_copy_dim :].reshape(
+            B, self.num_heads, T, self.rt_R, self.rt_rel_dim
+        )
+        g_t = torch.sigmoid(
+            F.linear(x, self.rt_tgt_gate_proj.type_as(x))
+            + self.rt_tgt_gate_bias.to(dtype=x.dtype)
+        ).view(B, T, self.num_heads, self.rt_R, 1).transpose(1, 2)
+        y_rel = y_rel * g_t
+        y_rel = y_rel.reshape(B, self.num_heads, T, self.rt_R * self.rt_rel_dim)
+        return torch.cat([y_copy, y_rel], dim=-1)
+
+    def _ha_pack_values(self, v: Tensor, x: Tensor) -> tuple[Tensor, Tensor]:
+        """Pack plain V + outer-product hyper values for Hyper-Attention.
+        Returns (packed_v, z_lat) where z_lat is the query-side latent."""
+        B, T = v.shape[:2]
+        v_plain = v[..., : self.ha_plain_dim]  # (B, T, H_kv, plain_dim)
+        # Compute outer product latents
+        a_lat = F.linear(x, self.ha_a_proj.type_as(x)).view(
+            B, T, self.num_kv_heads, self.ha_r
+        )
+        b_lat = F.linear(x, self.ha_b_proj.type_as(x)).view(
+            B, T, self.num_kv_heads, self.ha_r
+        )
+        outer_flat = (a_lat.unsqueeze(-1) * b_lat.unsqueeze(-2)).reshape(
+            B, T, self.num_kv_heads, self.ha_hyper_dim
+        )
+        packed_v = torch.cat([v_plain, outer_flat], dim=-1)
+        # Query-side latent
+        z_lat = F.linear(x, self.ha_z_proj.type_as(x)).view(
+            B, T, self.num_heads, self.ha_r
+        )
+        return packed_v, z_lat
+
+    def _ha_unpack_output(self, y: Tensor, z_lat: Tensor, sa_lambda: Tensor) -> Tensor:
+        """Unpack Hyper-Attention output and apply matrix to query latent.
+        Returns projected output (B, T, dim)."""
+        B, H, T, _ = y.shape
+        u_plain = y[..., : self.ha_plain_dim]
+        m_flat = y[..., self.ha_plain_dim :]
+        M = m_flat.view(B, H, T, self.ha_r, self.ha_r)
+        z = z_lat.transpose(1, 2)  # (B, H, T, r)
+        h_hyp = torch.einsum("bhtrs,bhts->bhtr", M, z)
+        if self.ha_activation == "silu":
+            h_hyp = F.silu(h_hyp)
+        elif self.ha_activation == "relu":
+            h_hyp = F.relu(h_hyp)
+        # else: identity
+        y_cat = torch.cat([u_plain, h_hyp], dim=-1)  # (B, H, T, plain_dim+r)
+        y_flat = y_cat.transpose(1, 2).contiguous().view(
+            B, T, self.num_heads * (self.ha_plain_dim + self.ha_r)
+        )
+        return sa_lambda * F.linear(y_flat, self.ha_out_proj.type_as(y_flat))
+
     def _project_qkv(self, x: Tensor, sa_lambda: Tensor):
         if self.use_factorized:
             qkv = self.qkvo_w(x)[:, :, : self.qkv_dim]
@@ -2612,6 +2756,14 @@ class CausalSelfAttention(nn.Module):
 
         # Value embedding with gating (from train_gpt.py)
         v = self._apply_value_embed(v, ve, x)
+
+        # Attention variant: pack values before attention
+        ha_z_lat = None
+        if self.attn_variant == "relational_transport":
+            v = self._rt_pack_values(v, x)
+        elif self.attn_variant == "hyper_attention":
+            v, ha_z_lat = self._ha_pack_values(v, x)
+
         q_heads = q.transpose(1, 2)
         k_heads = k.transpose(1, 2)
         v_heads = v.transpose(1, 2)
@@ -2665,10 +2817,16 @@ class CausalSelfAttention(nn.Module):
                     self.attn_gate(x[..., : self.attn_gate.weight.size(-1)])
                 ).transpose(1, 2).unsqueeze(-1)
 
-            y = y.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
-
-            # Output projection using merged weights with sa_lambdas[1]
-            y = self._project_o(y, sa_lambdas[1])
+            # Attention variant: unpack and project output (cache path)
+            if self.attn_variant == "relational_transport":
+                y = self._rt_unpack_output(y, x)
+                y = y.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
+                y = self._project_o(y, sa_lambdas[1])
+            elif self.attn_variant == "hyper_attention":
+                y = self._ha_unpack_output(y, ha_z_lat, sa_lambdas[1])
+            else:
+                y = y.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
+                y = self._project_o(y, sa_lambdas[1])
 
             kv_cache["k"] = cat_k
             kv_cache["v"] = cat_v
@@ -2711,10 +2869,16 @@ class CausalSelfAttention(nn.Module):
                 self.attn_gate(x[..., : self.attn_gate.weight.size(-1)])
             ).transpose(1, 2).unsqueeze(-1)
 
-        y = y.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
-
-        # Output projection using merged weights with sa_lambdas[1]
-        y = self._project_o(y, sa_lambdas[1])
+        # Attention variant: unpack and project output
+        if self.attn_variant == "relational_transport":
+            y = self._rt_unpack_output(y, x)
+            y = y.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
+            y = self._project_o(y, sa_lambdas[1])
+        elif self.attn_variant == "hyper_attention":
+            y = self._ha_unpack_output(y, ha_z_lat, sa_lambdas[1])
+        else:
+            y = y.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
+            y = self._project_o(y, sa_lambdas[1])
 
         if kv_cache is not None and kv_cache.get("k") is None:
             kv_cache["k"] = k_heads
@@ -2752,6 +2916,7 @@ class Block(nn.Module):
         use_xsa: bool = False,
         use_boundary_delta: bool = False,
         use_resid_mix: bool = False,
+        attn_variant_config: dict = None,
     ):
         super().__init__()
         self.dim = dim
@@ -2762,6 +2927,7 @@ class Block(nn.Module):
         canon_config = canon_config or {}
         xsa_config = xsa_config or {}
         boundary_delta_config = boundary_delta_config or {}
+        attn_variant_config = attn_variant_config or {}
         self.canon_enabled = bool(canon_set)
         self.use_resid_mix = bool(use_resid_mix)
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
@@ -2784,6 +2950,7 @@ class Block(nn.Module):
                 xsa_config=xsa_config,
                 use_xsa=use_xsa,
                 use_canon_b="B" in canon_set,
+                attn_variant_config=attn_variant_config,
             )
         else:
             self.attn = None
@@ -2983,6 +3150,7 @@ class GPT(nn.Module):
         low_rank_config: dict = None,
         residual_connection_config: dict = None,
         wd_multipliers: dict = None,
+        attn_variant_config: dict = None,
     ):
         super().__init__()
         self.model_config = model_config
@@ -3001,6 +3169,7 @@ class GPT(nn.Module):
         self.resid_mix_config = resid_mix_config or {}
         self.bigram_config = bigram_config or {}
         self.low_rank_config = _resolve_low_rank_config(low_rank_config)
+        self.attn_variant_config = attn_variant_config or {}
         self.low_rank_pairs: list[tuple[Tensor, Tensor]] = []
 
         c_proj_lr_mul = lr_multipliers["c_proj"]
@@ -3202,6 +3371,7 @@ class GPT(nn.Module):
                     use_xsa=use_xsa,
                     use_boundary_delta=use_boundary_delta,
                     use_resid_mix=use_resid_mix,
+                    attn_variant_config=self.attn_variant_config,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
