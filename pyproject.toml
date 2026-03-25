@@ -19,6 +19,7 @@ dependencies = [
     "setuptools",
     "wandb",
     "modal",
+    "python-dotenv>=1.2.1",
 ]
 
 [tool.setuptools]
